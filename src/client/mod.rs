@@ -1258,6 +1258,32 @@ where
         response_rx.recv().await.map_err(|_| Error::Shutdown)?
     }
 
+    /// Sends `message` to a service as it is, with the request id it carries, and awaits no
+    /// response here.
+    ///
+    /// The request id is the caller's: the client id names the calling client
+    /// (`feat_req_someip_699`) and the session id is chosen by the client for each call, and
+    /// the server copies both into its answer (`feat_req_someip_79`). So the answer arrives as a
+    /// [`ClientUpdate::Unicast`] with its whole header, for the caller to match by the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service is not found, unicast binding fails, or the UDP send
+    /// fails. Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is not an IPv4/UDP
+    /// socket, and [`Error::Shutdown`] if the client's run-loop future has exited.
+    pub async fn relay_to_service(
+        &self,
+        key: ServiceEndpointKey,
+        message: crate::protocol::Message<MessageDefinitions>,
+    ) -> Result<(), Error> {
+        let (send_rx, ctrl_msg) = ControlMessage::relay(key, message);
+        self.control_sender
+            .send(ctrl_msg)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        send_rx.recv().await.map_err(|_| Error::Shutdown)?
+    }
+
     /// Register an E2E profile for the given key.
     ///
     /// Once registered, incoming messages matching `key` will have their E2E

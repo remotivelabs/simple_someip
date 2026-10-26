@@ -1297,3 +1297,69 @@ async fn test_the_clients_request_resolves_with_the_servers_response() {
     client.shut_down();
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_a_relayed_request_keeps_its_ids_and_its_answer_arrives_as_an_update() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+    let answer = tokio::spawn(async move {
+        let request = requests.recv().await.expect("a request");
+        publisher
+            .respond(
+                request.target(),
+                Reply::response(ReturnCode::NotReady),
+                request.payload(),
+            )
+            .await
+            .unwrap();
+        request.target()
+    });
+
+    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let _run_handle = tokio::spawn(run_fut);
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(SERVER_IP, port));
+    client
+        .add_endpoint(ServiceEndpointKey::udp(service_id, server_addr), 1, 0)
+        .await
+        .unwrap();
+    let message_id = MessageId::new_from_service_and_method(service_id, 0x0007);
+    let request = Message::new(
+        Header::new(
+            message_id,
+            0x00AB_0005,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            4,
+        ),
+        RawPayload::from_payload_bytes(message_id, b"ping").unwrap(),
+    );
+    client
+        .relay_to_service(ServiceEndpointKey::udp(service_id, server_addr), request)
+        .await
+        .expect("relay failed");
+
+    let target = answer.await.unwrap();
+    assert_eq!((target.client_id(), target.session_id()), (0x00AB, 0x0005));
+
+    let ClientUpdate::Unicast {
+        message, source, ..
+    } = recv_unicast(&mut updates).await
+    else {
+        unreachable!("recv_unicast returns a Unicast update");
+    };
+    assert_eq!(source, server_addr);
+    assert_eq!(message.header().request_id(), 0x00AB_0005);
+    assert_eq!(
+        message.header().message_type().message_type(),
+        MessageType::Response
+    );
+    assert_eq!(message.header().return_code(), ReturnCode::NotReady);
+    assert_eq!(message.payload().raw_bytes(), Some(&b"ping"[..]));
+
+    client.shut_down();
+    server_handle.abort();
+}

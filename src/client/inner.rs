@@ -73,6 +73,15 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
         /// Fires when a matching unicast response arrives.
         response: C::OneshotSender<Result<P, Error>>,
     },
+    /// Send `message` to a service as it is, with the request id it carries, and await no
+    /// response here: the answer, which echoes the id (`feat_req_someip_79`), arrives as a
+    /// [`ClientUpdate::Unicast`](crate::ClientUpdate::Unicast).
+    Relay {
+        key: ServiceEndpointKey,
+        message: Message<P>,
+        /// Fires when the UDP send completes (or errors on lookup/bind).
+        send_complete: C::OneshotSender<Result<(), Error>>,
+    },
     Subscribe {
         key: ServiceEndpointKey,
         major_version: u8,
@@ -112,6 +121,11 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug for Con
             Self::RemoveEndpoint(key, _) => f.debug_tuple("RemoveEndpoint").field(key).finish(),
             Self::SendToService { key, message, .. } => f
                 .debug_struct("SendToService")
+                .field("key", key)
+                .field("message", message)
+                .finish_non_exhaustive(),
+            Self::Relay { key, message, .. } => f
+                .debug_struct("Relay")
                 .field("key", key)
                 .field("message", message)
                 .finish_non_exhaustive(),
@@ -228,6 +242,22 @@ where
     }
 
     #[must_use]
+    pub fn relay(
+        key: ServiceEndpointKey,
+        message: Message<P>,
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (send_complete_tx, send_complete_rx) = C::oneshot();
+        (
+            send_complete_rx,
+            Self::Relay {
+                key,
+                message,
+                send_complete: send_complete_tx,
+            },
+        )
+    }
+
+    #[must_use]
     pub fn subscribe(
         key: ServiceEndpointKey,
         major_version: u8,
@@ -297,6 +327,9 @@ where
             } => {
                 let _ = send_complete.send(Err(Error::Capacity(structure_name)));
                 let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+            Self::Relay { send_complete, .. } => {
+                let _ = send_complete.send(Err(Error::Capacity(structure_name)));
             }
             Self::QueryRebootFlag(response) => {
                 let _ = response.send(Err(Error::Capacity(structure_name)));
@@ -554,6 +587,31 @@ where
         }
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
+    }
+
+    /// Where a message to `key`'s endpoint goes and the unicast socket it goes out from, bound
+    /// on demand: the endpoint's registered source port, or the first socket, or an ephemeral
+    /// one when there is none. Today's transports are IPv4 + UDP only.
+    async fn outbound(&mut self, key: ServiceEndpointKey) -> Result<(SocketAddrV4, u16), Error> {
+        let Some(endpoint_info) = self.service_registry.get(key) else {
+            return Err(Error::ServiceNotFound);
+        };
+        let desired_port = endpoint_info.local_port;
+        let (SocketAddr::V4(target), crate::TransportProtocol::Udp) =
+            (key.endpoint.addr, key.endpoint.protocol)
+        else {
+            return Err(Error::UnsupportedEndpoint(key.endpoint));
+        };
+        let source_port = if desired_port != 0 {
+            self.bind_unicast(desired_port).await?
+        } else if let Some(port) = self.unicast_sockets.keys().next() {
+            *port
+        } else {
+            let port = self.bind_unicast(0).await?;
+            debug!("Auto-bound unicast on port {} for a send", port);
+            port
+        };
+        Ok((target, source_port))
     }
 
     /// Tracks the caller's response channel against `request_id` so a
@@ -993,50 +1051,32 @@ where
                         debug!("RemoveEndpoint: caller dropped the response receiver");
                     }
                 }
+                ControlMessage::Relay {
+                    key,
+                    message,
+                    send_complete,
+                } => {
+                    let (target, source_port) = match self.outbound(key).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            let _ = send_complete.send(Err(e));
+                            return;
+                        }
+                    };
+                    let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
+                    let _ = send_complete.send(socket.send(target, message).await);
+                }
                 ControlMessage::SendToService {
                     key,
                     mut message,
                     send_complete,
                     response,
                 } => {
-                    let Some(endpoint_info) = self.service_registry.get(key) else {
-                        let _ = send_complete.send(Err(Error::ServiceNotFound));
-                        return;
-                    };
-                    let desired_port = endpoint_info.local_port;
-                    // The send target is the key's endpoint; today's
-                    // transports are IPv4 + UDP only.
-                    let (SocketAddr::V4(target), crate::TransportProtocol::Udp) =
-                        (key.endpoint.addr, key.endpoint.protocol)
-                    else {
-                        let _ = send_complete.send(Err(Error::UnsupportedEndpoint(key.endpoint)));
-                        return;
-                    };
-
-                    let source_port = if desired_port == 0 {
-                        // Ephemeral: auto-bind only if no sockets exist, then use first
-                        if self.unicast_sockets.is_empty() {
-                            match self.bind_unicast(0).await {
-                                Ok(port) => {
-                                    debug!("Auto-bound unicast on port {} for SendToService", port);
-                                    port
-                                }
-                                Err(e) => {
-                                    let _ = send_complete.send(Err(e));
-                                    return;
-                                }
-                            }
-                        } else {
-                            *self.unicast_sockets.keys().next().unwrap()
-                        }
-                    } else {
-                        // Specific port: bind if not already bound
-                        match self.bind_unicast(desired_port).await {
-                            Ok(port) => port,
-                            Err(e) => {
-                                let _ = send_complete.send(Err(e));
-                                return;
-                            }
+                    let (target, source_port) = match self.outbound(key).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            let _ = send_complete.send(Err(e));
+                            return;
                         }
                     };
                     let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
