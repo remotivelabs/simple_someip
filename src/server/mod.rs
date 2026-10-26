@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod request;
 mod runtime;
 mod sd_state;
 mod service_info;
@@ -15,6 +16,13 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
+#[cfg(feature = "_alloc")]
+pub use request::OwnedRequest;
+#[cfg(feature = "server-tokio")]
+pub use request::RequestSender;
+pub use request::{
+    ExceptionWithoutError, Reply, Request, RequestObserver, RequestObserverHandle, ResponseTarget,
+};
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -445,6 +453,9 @@ where
     /// and the source `SocketAddrV4`; the consumer is responsible for
     /// re-parsing the SOME/IP header and any E2E check.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`]. `None` observes none.
+    pub request_observer: Option<RequestObserverHandle>,
 }
 
 /// Tokio-defaulted constructor.
@@ -490,6 +501,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         }
     }
 }
@@ -515,6 +527,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -527,6 +540,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -542,6 +556,7 @@ where
             e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -557,6 +572,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -570,6 +586,18 @@ where
     #[must_use]
     pub fn with_non_sd_observer(mut self, observer: Option<(NonSdRequestCallback, usize)>) -> Self {
         self.non_sd_observer = observer;
+        self
+    }
+
+    /// Tell `observer` about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`].
+    #[cfg(feature = "_alloc")]
+    #[must_use]
+    pub fn with_request_observer(
+        mut self,
+        observer: impl RequestObserver + Send + Sync + 'static,
+    ) -> Self {
+        self.request_observer = Some(Arc::new(observer));
         self
     }
 }
@@ -677,6 +705,9 @@ where
     /// (method requests). `None` reproduces the default "non-SD
     /// ignored" behavior.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`]. `None` observes none.
+    pub request_observer: Option<RequestObserverHandle>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -790,6 +821,8 @@ pub struct Server<
     /// surfaces those datagrams to the consumer (used by halo's FFI to
     /// dispatch HWP1 method requests).
     non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service; see [`RequestObserver`].
+    request_observer: Option<RequestObserverHandle>,
 }
 
 /// Callback invoked by the server's `recv_loop` for every non-SD
@@ -945,6 +978,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         };
         Self::new_with_deps(deps, config, multicast_loopback).await
     }
@@ -986,6 +1020,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         };
         Self::new_passive_with_deps(deps, config).await
     }
@@ -1040,6 +1075,7 @@ where
             e2e_registry,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         } = deps;
 
         // Bind unicast socket for receiving subscriptions, then wrap
@@ -1097,6 +1133,7 @@ where
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1133,6 +1170,7 @@ where
             e2e_registry,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         } = deps;
 
         // Bind unicast socket at the configured local_port.
@@ -1181,6 +1219,7 @@ where
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1266,6 +1305,7 @@ where
             is_passive: false,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
+            request_observer: deps.request_observer,
         })
     }
 
@@ -1332,6 +1372,7 @@ where
             is_passive: true,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
+            request_observer: deps.request_observer,
         })
     }
 
@@ -1439,6 +1480,8 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
+        #[allow(clippy::clone_on_copy)]
+        let request_observer = self.request_observer.clone();
         #[allow(noop_method_call)]
         let started = self.started.clone();
 
@@ -1458,7 +1501,7 @@ where
                 return Err(Error::InvalidUsage("server_already_running"));
             }
 
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R, _>(
                 config,
                 unicast_socket,
                 sd_socket,
@@ -1472,6 +1515,7 @@ where
                 recv_send_buf,
                 announce_send_buf,
                 non_sd_observer,
+                request::observer(request_observer.as_ref()),
             )
             .await
         }
@@ -1660,6 +1704,7 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
+        let request_observer = self.request_observer.clone();
         let started = self.started.clone();
 
         async move {
@@ -1691,7 +1736,7 @@ where
             // callers pass their own via `run_with_buffers`.
             let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R, _>(
                 config,
                 unicast_socket,
                 sd_socket,
@@ -1705,6 +1750,7 @@ where
                 &mut recv_send_buf,
                 &mut announce_send_buf,
                 non_sd_observer,
+                request::observer(request_observer.as_ref()),
             )
             .await
         }
@@ -1895,6 +1941,7 @@ mod tests {
             publisher,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: None,
+            request_observer: None,
         };
         (handles, bound_port)
     }
@@ -2136,6 +2183,7 @@ mod tests {
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: subscriptions.clone(),
             non_sd_observer: None,
+            request_observer: None,
         };
         let config = ServerConfig::new(0x5B, 1)
             .with_interface(Ipv4Addr::LOCALHOST)

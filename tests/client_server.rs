@@ -36,6 +36,11 @@ use simple_someip::{
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+
+use simple_someip::protocol::{MessageType, MessageTypeField, MessageView, ReturnCode};
+use simple_someip::server::{OwnedRequest, Reply, RequestSender};
+use simple_someip::{Encode, ServerDeps};
 
 /// Allocate a unique service ID per test invocation. Multiple
 /// integration tests in this file run in parallel (cargo's default) and
@@ -1034,4 +1039,261 @@ async fn test_two_devices_same_service_instance_addressed_independently() {
     client.shut_down();
     server_a_handle.abort();
     server_b_handle.abort();
+}
+
+/// A server told about every request through a channel, on an ephemeral port: the server, its
+/// port and the requests.
+async fn create_answering_server(
+    service_id: u16,
+) -> (TestServer, u16, tokio::sync::mpsc::Receiver<OwnedRequest>) {
+    let (sender, requests) = RequestSender::channel(8);
+    let deps = ServerDeps::tokio().with_request_observer(sender);
+    let config = ServerConfig::new(service_id, 1)
+        .with_interface(SERVER_IP)
+        .with_local_port(0);
+    let (server, _handles, _run): (TestServer, _, _) =
+        TestServer::new_with_deps(deps, config, false)
+            .await
+            .expect("Server::new_with_deps failed");
+    let port = match server.unicast_local_addr().expect("local_addr failed") {
+        SocketAddr::V4(a) => a.port(),
+        SocketAddr::V6(_) => panic!("expected IPv4"),
+    };
+    (server, port, requests)
+}
+
+/// A request datagram to `service_id`/`method_id`: `message_type` with `request_id`, protocol
+/// version 1, interface version 2, and `payload`.
+fn request_bytes(
+    service_id: u16,
+    method_id: u16,
+    message_type: MessageType,
+    request_id: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let header = Header::new(
+        MessageId::new_from_service_and_method(service_id, method_id),
+        request_id,
+        1,
+        2,
+        MessageTypeField::new(message_type, false),
+        ReturnCode::Ok,
+        payload.len(),
+    );
+    let mut bytes = vec![0u8; 16 + payload.len()];
+    let header_len = header.encode_to_slice(&mut bytes).unwrap();
+    bytes[header_len..].copy_from_slice(payload);
+    bytes
+}
+
+/// The next request the server was told about.
+async fn next_request(requests: &mut tokio::sync::mpsc::Receiver<OwnedRequest>) -> OwnedRequest {
+    tokio::time::timeout(Duration::from_secs(2), requests.recv())
+        .await
+        .expect("timed out waiting for the request")
+        .expect("the request channel closed")
+}
+
+/// The next datagram `peer` receives.
+async fn next_datagram(peer: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+    let mut buf = [0u8; 256];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for the answer")
+        .expect("recv_from failed");
+    (buf[..len].to_vec(), from)
+}
+
+#[tokio::test]
+async fn test_a_request_is_observed_and_its_response_goes_back_to_the_caller() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+    let server_addr = SocketAddrV4::new(SERVER_IP, port);
+
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    peer.send_to(
+        &request_bytes(
+            service_id,
+            0x0007,
+            MessageType::Request,
+            0x00AB_0005,
+            b"ping",
+        ),
+        server_addr,
+    )
+    .await
+    .unwrap();
+
+    let request = next_request(&mut requests).await;
+    let target = request.target();
+    assert!(request.expects_response());
+    assert_eq!(request.payload(), b"ping");
+    assert_eq!(request.e2e_status(), E2ECheckStatus::Unchecked);
+    assert_eq!(SocketAddr::V4(target.source()), peer.local_addr().unwrap());
+    assert_eq!(
+        (target.service_id(), target.method_id()),
+        (service_id, 0x0007)
+    );
+    assert_eq!(target.request_id(), 0x00AB_0005);
+    assert_eq!(
+        (target.protocol_version(), target.interface_version()),
+        (1, 2)
+    );
+
+    publisher.respond(target, Reply::OK, b"pong").await.unwrap();
+
+    let (answer, from) = next_datagram(&peer).await;
+    // feat_req_someip_49: the answer comes from the address and port the request went to.
+    assert_eq!(from, SocketAddr::V4(server_addr));
+    let view = MessageView::parse(&answer).unwrap();
+    let header = view.header();
+    assert_eq!(header.message_type().message_type(), MessageType::Response);
+    assert_eq!(header.return_code(), ReturnCode::Ok);
+    assert_eq!(header.request_id(), 0x00AB_0005);
+    assert_eq!(
+        header.message_id(),
+        MessageId::new_from_service_and_method(service_id, 0x0007)
+    );
+    assert_eq!(
+        (header.protocol_version(), header.interface_version()),
+        (1, 2)
+    );
+    assert_eq!(view.payload_bytes(), b"pong");
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_a_fire_and_forget_request_is_observed_and_expects_no_response() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    peer.send_to(
+        &request_bytes(
+            service_id,
+            0x0008,
+            MessageType::RequestNoReturn,
+            0x0001_0002,
+            b"set",
+        ),
+        SocketAddrV4::new(SERVER_IP, port),
+    )
+    .await
+    .unwrap();
+
+    let request = next_request(&mut requests).await;
+    assert!(!request.expects_response());
+    assert_eq!(request.message_type(), MessageType::RequestNoReturn);
+    assert_eq!(request.payload(), b"set");
+    assert_eq!(request.target().method_id(), 0x0008);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_an_error_travels_in_a_response_or_in_an_exception() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    peer.send_to(
+        &request_bytes(service_id, 0x0009, MessageType::Request, 0x0001_0003, b""),
+        SocketAddrV4::new(SERVER_IP, port),
+    )
+    .await
+    .unwrap();
+    let target = next_request(&mut requests).await.target();
+
+    publisher
+        .respond(target, Reply::response(ReturnCode::NotReady), b"")
+        .await
+        .unwrap();
+    let (answer, _) = next_datagram(&peer).await;
+    let header = MessageView::parse(&answer).unwrap().header();
+    assert_eq!(header.message_type().message_type(), MessageType::Response);
+    assert_eq!(header.return_code(), ReturnCode::NotReady);
+    assert_eq!(header.request_id(), 0x0001_0003);
+
+    publisher
+        .respond(
+            target,
+            Reply::exception(ReturnCode::UnknownMethod).unwrap(),
+            b"",
+        )
+        .await
+        .unwrap();
+    let (answer, _) = next_datagram(&peer).await;
+    let header = MessageView::parse(&answer).unwrap().header();
+    assert_eq!(header.message_type().message_type(), MessageType::Error);
+    assert_eq!(header.return_code(), ReturnCode::UnknownMethod);
+    assert_eq!(header.request_id(), 0x0001_0003);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_the_clients_request_resolves_with_the_servers_response() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+    let echo = tokio::spawn(async move {
+        let request = requests.recv().await.expect("a request");
+        publisher
+            .respond(request.target(), Reply::OK, request.payload())
+            .await
+            .unwrap();
+        request.target()
+    });
+
+    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let _run_handle = tokio::spawn(run_fut);
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(SERVER_IP, port));
+    client
+        .add_endpoint(ServiceEndpointKey::udp(service_id, server_addr), 1, 0)
+        .await
+        .unwrap();
+    let message_id = MessageId::new_from_service_and_method(service_id, 0x0007);
+    let request = Message::new(
+        Header::new(
+            message_id,
+            0,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            4,
+        ),
+        RawPayload::from_payload_bytes(message_id, b"ping").unwrap(),
+    );
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.request(ServiceEndpointKey::udp(service_id, server_addr), request),
+    )
+    .await
+    .expect("timed out waiting for the response")
+    .expect("request failed");
+
+    assert_eq!(response.raw_bytes(), Some(&b"ping"[..]));
+    let target = echo.await.unwrap();
+    assert_eq!(
+        (target.service_id(), target.method_id()),
+        (service_id, 0x0007)
+    );
+
+    client.shut_down();
+    server_handle.abort();
 }
