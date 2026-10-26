@@ -72,6 +72,7 @@ define_static_channels! {
         (Result<(), ClientError>, 16),
         (Result<RawPayload, ClientError>, 8),
         (Result<RebootFlag, ClientError>, 8),
+        (Result<simple_someip::protocol::sd::SdEndpoint, ClientError>, 8),
     ],
     bounded: [
         ((ControlMessage<RawPayload, E2ETestChannels>, 4), 8),

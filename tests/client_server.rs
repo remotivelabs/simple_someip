@@ -226,6 +226,58 @@ async fn test_client_server_subscribe_and_receive_event() {
     server_handle.abort();
 }
 
+/// SD on a group and port of the deployment's own, not the standard ones: the server offers and
+/// answers there, the client subscribes there, and the event still arrives.
+#[tokio::test]
+async fn test_subscribe_and_receive_event_on_a_configured_sd_endpoint() {
+    let endpoint = sd::SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 254), 30491).unwrap();
+    let service_id = next_service_id();
+    let config = ServerConfig::new(service_id, 1)
+        .with_interface(SERVER_IP)
+        .with_local_port(0)
+        .with_sd_endpoint(endpoint);
+    let (server, _handles, _run): (TestServer, _, _) =
+        TestServer::new(config).await.expect("Server::new failed");
+    let server_port = match server.unicast_local_addr().expect("local_addr failed") {
+        std::net::SocketAddr::V4(a) => a.port(),
+        _ => panic!("expected IPv4"),
+    };
+    let publisher = server.publisher();
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    let (client, mut updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let _run_handle = tokio::spawn(run_fut);
+    client.set_sd_endpoint(endpoint).await.unwrap();
+    assert_eq!(client.sd_endpoint().await.unwrap(), endpoint);
+    let server_addr = SocketAddrV4::new(SERVER_IP, server_port);
+    let key = ServiceEndpointKey::udp(service_id, SocketAddr::V4(server_addr));
+    client.add_endpoint(key.clone(), 1, 0).await.unwrap();
+    client.subscribe(key, 1, 3, 0x01, 0).await.unwrap();
+
+    assert!(
+        wait_for_subscribers(&publisher, service_id, 1, 0x01).await,
+        "the server should have registered the subscriber through the configured SD endpoint"
+    );
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(250), updates.recv()).await;
+
+    let event_msg = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header())
+        .expect("in-tree SdHeader sizing is infallible");
+    let sent = publisher
+        .publish_event(service_id, 1, 0x01, &event_msg)
+        .await
+        .expect("publish_event failed");
+    assert_eq!(sent, 1);
+    let update = recv_unicast(&mut updates).await;
+    assert!(
+        matches!(update, ClientUpdate::Unicast { .. }),
+        "expected Unicast, got {update:?}"
+    );
+
+    client.unbind_discovery().await.unwrap();
+    client.shut_down();
+    server_handle.abort();
+}
+
 #[tokio::test]
 async fn test_client_send_sd_auto_binds_discovery() {
     // Create server so there is something to send to

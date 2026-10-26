@@ -87,6 +87,7 @@ use std::sync::{Arc, Mutex, RwLock};
 /// | `oneshot` | `Result<(), client::Error>` | per-pool default |
 /// | `oneshot` | `Result<P, client::Error>` | per-pool default |
 /// | `oneshot` | `Result<protocol::sd::RebootFlag, client::Error>` | per-pool default |
+/// | `oneshot` | `Result<protocol::sd::SdEndpoint, client::Error>` | per-pool default |
 /// | `bounded` | `(ControlMessage<P, C>, 4)` | per-pool default |
 /// | `bounded` | `(SendMessage<P, C>, 16)` | per-pool default |
 /// | `bounded` | `(Result<ReceivedMessage<P>, client::Error>, 16)` | per-pool default |
@@ -123,6 +124,7 @@ where
     Result<(), Error>: OneshotPooled<Self>,
     Result<P, Error>: OneshotPooled<Self>,
     Result<protocol::sd::RebootFlag, Error>: OneshotPooled<Self>,
+    Result<protocol::sd::SdEndpoint, Error>: OneshotPooled<Self>,
     ControlMessage<P, Self>: BoundedPooled<Self, 4>,
     SendMessage<P, Self>: BoundedPooled<Self, 16>,
     Result<ReceivedMessage<P>, Error>: BoundedPooled<Self, 16>,
@@ -137,6 +139,7 @@ where
     Result<(), Error>: OneshotPooled<C>,
     Result<P, Error>: OneshotPooled<C>,
     Result<protocol::sd::RebootFlag, Error>: OneshotPooled<C>,
+    Result<protocol::sd::SdEndpoint, Error>: OneshotPooled<C>,
     ControlMessage<P, C>: BoundedPooled<C, 4>,
     SendMessage<P, C>: BoundedPooled<C, 16>,
     Result<ReceivedMessage<P>, Error>: BoundedPooled<C, 16>,
@@ -718,6 +721,7 @@ where
     Result<(), Error>: OneshotPooled<C>,
     Result<MessageDefinitions, Error>: OneshotPooled<C>,
     Result<protocol::sd::RebootFlag, Error>: OneshotPooled<C>,
+    Result<protocol::sd::SdEndpoint, Error>: OneshotPooled<C>,
     ControlMessage<MessageDefinitions, C>: BoundedPooled<C, 4>,
     SendMessage<MessageDefinitions, C>: BoundedPooled<C, 16>,
     Result<ReceivedMessage<MessageDefinitions>, Error>: BoundedPooled<C, 16>,
@@ -898,6 +902,37 @@ where
         response.recv().await.map_err(|_| Error::Shutdown)??;
         self.interface.set(interface);
         Ok(())
+    }
+
+    /// Exchanges SD on `endpoint` instead of the standard group and port; a bound discovery
+    /// socket is rebound there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if rebinding the discovery socket fails, and [`Error::Shutdown`] if the
+    /// client's run-loop future has exited.
+    pub async fn set_sd_endpoint(&self, endpoint: protocol::sd::SdEndpoint) -> Result<(), Error> {
+        let (response, message) = ControlMessage::set_sd_endpoint(endpoint);
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
+    }
+
+    /// Where SD is exchanged: [`protocol::sd::SdEndpoint::DEFAULT`] unless
+    /// [`set_sd_endpoint`](Self::set_sd_endpoint) changed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Shutdown`] if the client's run-loop future has exited.
+    pub async fn sd_endpoint(&self) -> Result<protocol::sd::SdEndpoint, Error> {
+        let (response, message) = ControlMessage::query_sd_endpoint();
+        self.control_sender
+            .send(message)
+            .await
+            .map_err(|()| Error::Shutdown)?;
+        response.recv().await.map_err(|_| Error::Shutdown)?
     }
 
     /// Binds the SD multicast discovery socket.
@@ -1353,14 +1388,12 @@ where
     where
         <MessageDefinitions as PayloadWireFormat>::SdHeader: Send + 'static,
     {
-        use crate::protocol::sd;
         use crate::transport::OneshotRecv;
 
         // Use a WeakSender so this future does NOT keep the control channel
         // alive. When all strong Client handles are dropped (shut_down),
         // the weak sender will fail to upgrade and the loop exits cleanly.
         let weak_sender = self.control_sender.downgrade();
-        let target = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
         let interval = interval.max(std::time::Duration::from_millis(100));
 
         async move {
@@ -1368,6 +1401,33 @@ where
             let mut count = 0u64;
             loop {
                 timer.sleep(interval).await;
+                // Asked each tick: the endpoint may be set after the loop started.
+                let (endpoint_rx, endpoint_msg) =
+                    ControlMessage::<MessageDefinitions, TokioChannels>::query_sd_endpoint();
+                let Some(sender) = weak_sender.upgrade() else {
+                    crate::log::info!("Client shut down, stopping SD announcements");
+                    break;
+                };
+                let enqueue_ok = sender.send(endpoint_msg).await.is_ok();
+                drop(sender);
+                if !enqueue_ok {
+                    crate::log::warn!("SD announcement channel closed, stopping");
+                    break;
+                }
+                let target = match endpoint_rx.recv().await {
+                    Ok(Ok(endpoint)) => endpoint.multicast(),
+                    Ok(Err(e)) => {
+                        crate::log::warn!(
+                            "SD announcement endpoint query returned error ({:?}), skipping tick",
+                            e
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        crate::log::warn!("SD announcement endpoint query dropped, stopping");
+                        break;
+                    }
+                };
 
                 let (flag_rx, flag_msg) =
                     ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
