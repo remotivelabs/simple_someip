@@ -1458,3 +1458,77 @@ async fn test_a_server_and_a_client_share_the_sd_sockets_of_one_interface() {
     shared_client.shut_down();
     remote_run.abort();
 }
+
+/// Different services share one port (feat_req_someip_445): two servers served through the
+/// shared sockets on one local port each observe the requests of their own service and answer
+/// from the port. A second instance of one service there is refused, as instances of a service
+/// listen on different ports (feat_req_someip_648).
+#[tokio::test]
+async fn test_two_services_share_one_endpoint_socket() {
+    let interface = Ipv4Addr::new(127, 0, 0, 4);
+    let shared = simple_someip::SharedSd::bind(interface, sd::SdEndpoint::DEFAULT, true)
+        .await
+        .expect("the shared SD sockets");
+    let port: u16 = 30_604;
+    let ids = [next_service_id(), next_service_id()];
+    let mut servers = Vec::new();
+    let mut requests = Vec::new();
+    for id in ids {
+        let (sender, observed) = RequestSender::channel(8);
+        let (server, handles, run) = shared
+            .serve(
+                ServerDeps::tokio().with_request_observer(sender),
+                ServerConfig::new(id, 1).with_local_port(port),
+            )
+            .await
+            .expect("serve");
+        tokio::spawn(run);
+        servers.push((server, handles));
+        requests.push(observed);
+    }
+    assert!(
+        shared
+            .serve(
+                ServerDeps::tokio(),
+                ServerConfig::new(ids[0], 1).with_local_port(port)
+            )
+            .await
+            .is_err(),
+        "a second instance of one service on the port is refused"
+    );
+
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 3), 0))
+        .await
+        .unwrap();
+    let mut datagram = request_bytes(ids[0], 0x0001, MessageType::Request, 0x0001_0001, b"one");
+    datagram.extend(request_bytes(
+        ids[1],
+        0x0002,
+        MessageType::Request,
+        0x0001_0002,
+        b"two",
+    ));
+    peer.send_to(&datagram, (interface, port)).await.unwrap();
+
+    let expected: [(u16, u16, &[u8]); 2] = [(ids[0], 0x0001, b"one"), (ids[1], 0x0002, b"two")];
+    for (i, (id, method, payload)) in expected.into_iter().enumerate() {
+        let request = next_request(&mut requests[i]).await;
+        let target = request.target();
+        assert_eq!((target.service_id(), target.method_id()), (id, method));
+        assert_eq!(request.payload(), payload);
+        servers[i]
+            .1
+            .publisher
+            .respond(target, Reply::OK, payload)
+            .await
+            .unwrap();
+        let (answer, from) = next_datagram(&peer).await;
+        assert_eq!(from, SocketAddr::V4(SocketAddrV4::new(interface, port)));
+        let view = MessageView::parse(&answer).unwrap();
+        assert_eq!(
+            view.header().message_id(),
+            MessageId::new_from_service_and_method(id, method)
+        );
+        assert_eq!(view.payload_bytes(), payload);
+    }
+}

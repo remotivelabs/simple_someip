@@ -286,7 +286,9 @@ pub use server::{
     ServerHandles, ServerStorage, SubscriptionHandle,
 };
 #[cfg(all(feature = "client-tokio", feature = "server-tokio"))]
-pub use tokio_transport::shared_sd::{Origin, SharedSd, SharedSocket, SharedTap, SharedTransport};
+pub use tokio_transport::shared_sd::{
+    EndpointTap, Origin, SharedSd, SharedSocket, SharedTap, SharedTransport,
+};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]
