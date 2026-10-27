@@ -76,15 +76,6 @@ type TestServer = Server<
     std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
 >;
 
-/// Type alias for the event publisher concrete type used by `TestServer`'s
-/// publisher. Same shape rationale as [`TestServer`].
-type TestEventPublisher = simple_someip::server::EventPublisher<
-    std::sync::Arc<std::sync::Mutex<simple_someip::e2e::E2ERegistry>>,
-    std::sync::Arc<tokio::sync::RwLock<simple_someip::server::SubscriptionManager>>,
-    std::sync::Arc<simple_someip::TokioSocket>,
-    simple_someip::TokioSocket,
->;
-
 /// Create a server on an ephemeral unicast port, returning (Server, actual_port).
 ///
 /// `TestServer::new` returns a `(Server, ServerHandles, run)` tuple.
@@ -130,12 +121,19 @@ async fn create_server_on(
 
 /// Poll `has_subscribers` with retries until the server has processed the
 /// subscription. Returns true if subscribers appeared within the deadline.
-async fn wait_for_subscribers(
-    publisher: &TestEventPublisher,
+async fn wait_for_subscribers<R, S, H, T>(
+    publisher: &simple_someip::server::EventPublisher<R, S, H, T>,
     service_id: u16,
     instance_id: u16,
     event_group_id: u16,
-) -> bool {
+) -> bool
+where
+    R: simple_someip::transport::E2ERegistryHandle,
+    S: simple_someip::server::SubscriptionHandle,
+    for<'a> S::ForEachFuture<'a>: Send,
+    T: simple_someip::transport::TransportSocket + 'static,
+    H: simple_someip::transport::SharedHandle<T>,
+{
     for _ in 0..20 {
         if publisher
             .has_subscribers(service_id, instance_id, event_group_id)
@@ -1362,4 +1360,101 @@ async fn test_a_relayed_request_keeps_its_ids_and_its_answer_arrives_as_an_updat
 
     client.shut_down();
     server_handle.abort();
+}
+
+/// A server and a client on one interface share the SD port: the server, on 127.0.0.1, serves a
+/// plain client on 127.0.0.3; the client, also on 127.0.0.1, subscribes to a plain server on
+/// 127.0.0.2. Each of the two pairs is served through the shared sockets on 127.0.0.1:30490.
+#[tokio::test]
+async fn test_a_server_and_a_client_share_the_sd_sockets_of_one_interface() {
+    let shared = simple_someip::SharedSd::bind(Ipv4Addr::LOCALHOST, sd::SdEndpoint::DEFAULT, true)
+        .await
+        .expect("the shared SD sockets");
+
+    // The shared server, and a plain client of it on its own interface.
+    let served_id = next_service_id();
+    let (served, served_handles, served_run) = shared
+        .serve(
+            ServerDeps::tokio(),
+            ServerConfig::new(served_id, 1).with_local_port(0),
+        )
+        .await
+        .expect("serve");
+    tokio::spawn(served_run);
+    let served_addr = match served.unicast_local_addr().unwrap() {
+        SocketAddr::V4(a) => SocketAddr::V4(a),
+        SocketAddr::V6(_) => unreachable!(),
+    };
+    let (plain_client, mut plain_updates, run) = TestClient::new(Ipv4Addr::new(127, 0, 0, 3));
+    tokio::spawn(run);
+    plain_client
+        .add_endpoint(ServiceEndpointKey::udp(served_id, served_addr), 1, 0)
+        .await
+        .unwrap();
+    plain_client
+        .subscribe(
+            ServiceEndpointKey::udp(served_id, served_addr),
+            1,
+            3,
+            0x01,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wait_for_subscribers(&served_handles.publisher, served_id, 1, 0x01).await,
+        "the shared server registers the plain client's subscription through its tap"
+    );
+    let event = Message::<RawPayload>::new_sd(0x0001, &empty_sd_header()).unwrap();
+    served_handles
+        .publisher
+        .publish_event(served_id, 1, 0x01, &event)
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_unicast(&mut plain_updates).await,
+        ClientUpdate::Unicast { .. }
+    ));
+
+    // The shared client, subscribing to a plain server on another interface.
+    let remote_id = next_service_id();
+    let (remote, remote_port) = create_server(remote_id, 1).await;
+    let remote_publisher = remote.publisher();
+    let remote_run = tokio::spawn(async move { remote.run().await });
+    let (shared_client, mut shared_updates, run) = TestClient::new_with_deps(
+        simple_someip::ClientDeps::tokio(Ipv4Addr::LOCALHOST).with_factory(shared.transport()),
+        true,
+    );
+    tokio::spawn(run);
+    let remote_addr = SocketAddr::V4(SocketAddrV4::new(SERVER_IP, remote_port));
+    shared_client
+        .add_endpoint(ServiceEndpointKey::udp(remote_id, remote_addr), 1, 0)
+        .await
+        .unwrap();
+    shared_client
+        .subscribe(
+            ServiceEndpointKey::udp(remote_id, remote_addr),
+            1,
+            3,
+            0x01,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wait_for_subscribers(&remote_publisher, remote_id, 1, 0x01).await,
+        "the plain server registers the shared client's subscription"
+    );
+    remote_publisher
+        .publish_event(remote_id, 1, 0x01, &event)
+        .await
+        .unwrap();
+    assert!(matches!(
+        recv_unicast(&mut shared_updates).await,
+        ClientUpdate::Unicast { .. }
+    ));
+
+    plain_client.shut_down();
+    shared_client.shut_down();
+    remote_run.abort();
 }

@@ -285,6 +285,8 @@ pub use server::{
     NonSdRequestCallback, Reply, Request, RequestObserver, ResponseTarget, Server, ServerDeps,
     ServerHandles, ServerStorage, SubscriptionHandle,
 };
+#[cfg(all(feature = "client-tokio", feature = "server-tokio"))]
+pub use tokio_transport::shared_sd::{Origin, SharedSd, SharedSocket, SharedTap, SharedTransport};
 #[cfg(any(feature = "client-tokio", feature = "server-tokio"))]
 pub use tokio_transport::{TokioChannels, TokioSocket, TokioSpawner, TokioTimer, TokioTransport};
 #[cfg(feature = "bare_metal")]
