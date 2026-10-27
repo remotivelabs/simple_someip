@@ -261,6 +261,7 @@ async fn main() {
                 e2e_registry: e2e,
                 subscriptions: subs,
                 non_sd_observer: None,
+                request_observer: None,
             },
             config,
             false, // multicast_loopback

@@ -44,6 +44,13 @@ const UNICAST_SOCKETS_CAP: usize = 8;
 
 pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
     SetInterface(Ipv4Addr, C::OneshotSender<Result<(), Error>>),
+    /// Exchange SD on another group and port; a bound discovery socket is rebound there.
+    SetSdEndpoint(
+        crate::protocol::sd::SdEndpoint,
+        C::OneshotSender<Result<(), Error>>,
+    ),
+    /// Where SD is exchanged.
+    QuerySdEndpoint(C::OneshotSender<Result<crate::protocol::sd::SdEndpoint, Error>>),
     BindDiscovery(C::OneshotSender<Result<(), Error>>),
     UnbindDiscovery(C::OneshotSender<Result<(), Error>>),
     SendSD(
@@ -66,6 +73,15 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
         /// Fires when a matching unicast response arrives.
         response: C::OneshotSender<Result<P, Error>>,
     },
+    /// Send `message` to a service as it is, with the request id it carries, and await no
+    /// response here: the answer, which echoes the id (`feat_req_someip_79`), arrives as a
+    /// [`ClientUpdate::Unicast`](crate::ClientUpdate::Unicast).
+    Relay {
+        key: ServiceEndpointKey,
+        message: Message<P>,
+        /// Fires when the UDP send completes (or errors on lookup/bind).
+        send_complete: C::OneshotSender<Result<(), Error>>,
+    },
     Subscribe {
         key: ServiceEndpointKey,
         major_version: u8,
@@ -87,6 +103,10 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug for Con
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SetInterface(addr, _) => f.debug_tuple("SetInterface").field(addr).finish(),
+            Self::SetSdEndpoint(endpoint, _) => {
+                f.debug_tuple("SetSdEndpoint").field(endpoint).finish()
+            }
+            Self::QuerySdEndpoint(_) => f.write_str("QuerySdEndpoint"),
             Self::BindDiscovery(_) => f.write_str("BindDiscovery"),
             Self::UnbindDiscovery(_) => f.write_str("UnbindDiscovery"),
             Self::SendSD(addr, header, _) => {
@@ -101,6 +121,11 @@ impl<P: PayloadWireFormat + 'static, C: ChannelFactory> core::fmt::Debug for Con
             Self::RemoveEndpoint(key, _) => f.debug_tuple("RemoveEndpoint").field(key).finish(),
             Self::SendToService { key, message, .. } => f
                 .debug_struct("SendToService")
+                .field("key", key)
+                .field("message", message)
+                .finish_non_exhaustive(),
+            Self::Relay { key, message, .. } => f
+                .debug_struct("Relay")
                 .field("key", key)
                 .field("message", message)
                 .finish_non_exhaustive(),
@@ -130,11 +155,27 @@ where
     Result<(), Error>: crate::transport::OneshotPooled<C>,
     Result<P, Error>: crate::transport::OneshotPooled<C>,
     Result<crate::protocol::sd::RebootFlag, Error>: crate::transport::OneshotPooled<C>,
+    Result<crate::protocol::sd::SdEndpoint, Error>: crate::transport::OneshotPooled<C>,
 {
     #[must_use]
     pub fn set_interface(interface: Ipv4Addr) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
         let (sender, receiver) = C::oneshot();
         (receiver, Self::SetInterface(interface, sender))
+    }
+    #[must_use]
+    pub fn set_sd_endpoint(
+        endpoint: crate::protocol::sd::SdEndpoint,
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
+        (receiver, Self::SetSdEndpoint(endpoint, sender))
+    }
+    #[must_use]
+    pub fn query_sd_endpoint() -> (
+        C::OneshotReceiver<Result<crate::protocol::sd::SdEndpoint, Error>>,
+        Self,
+    ) {
+        let (sender, receiver) = C::oneshot();
+        (receiver, Self::QuerySdEndpoint(sender))
     }
     #[must_use]
     pub fn bind_discovery() -> (C::OneshotReceiver<Result<(), Error>>, Self) {
@@ -201,6 +242,22 @@ where
     }
 
     #[must_use]
+    pub fn relay(
+        key: ServiceEndpointKey,
+        message: Message<P>,
+    ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (send_complete_tx, send_complete_rx) = C::oneshot();
+        (
+            send_complete_rx,
+            Self::Relay {
+                key,
+                message,
+                send_complete: send_complete_tx,
+            },
+        )
+    }
+
+    #[must_use]
     pub fn subscribe(
         key: ServiceEndpointKey,
         major_version: u8,
@@ -254,6 +311,7 @@ where
     fn reject_with_capacity(self, structure_name: crate::CapacityKind) {
         match self {
             Self::SetInterface(_, response)
+            | Self::SetSdEndpoint(_, response)
             | Self::BindDiscovery(response)
             | Self::UnbindDiscovery(response)
             | Self::SendSD(_, _, response)
@@ -270,7 +328,13 @@ where
                 let _ = send_complete.send(Err(Error::Capacity(structure_name)));
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
+            Self::Relay { send_complete, .. } => {
+                let _ = send_complete.send(Err(Error::Capacity(structure_name)));
+            }
             Self::QueryRebootFlag(response) => {
+                let _ = response.send(Err(Error::Capacity(structure_name)));
+            }
+            Self::QuerySdEndpoint(response) => {
                 let _ = response.send(Err(Error::Capacity(structure_name)));
             }
             #[cfg(all(test, feature = "client-tokio"))]
@@ -331,6 +395,8 @@ pub(super) struct Inner<
     e2e_registry: R,
     /// Enable multicast loopback on SD sockets for same-host testing
     multicast_loopback: bool,
+    /// Where SD is exchanged; see [`crate::protocol::sd::SdEndpoint`].
+    sd_endpoint: crate::protocol::sd::SdEndpoint,
     /// Bind dispatch — abstracts the bind-and-spawn step over either a
     /// [`Spawner`](crate::transport::Spawner) (Send-required) or a
     /// [`LocalSpawner`](crate::transport::LocalSpawner) (single-task)
@@ -371,6 +437,7 @@ where
     Result<(), Error>: crate::transport::OneshotPooled<C>,
     Result<PayloadDefinitions, Error>: crate::transport::OneshotPooled<C>,
     Result<crate::protocol::sd::RebootFlag, Error>: crate::transport::OneshotPooled<C>,
+    Result<crate::protocol::sd::SdEndpoint, Error>: crate::transport::OneshotPooled<C>,
     ControlMessage<PayloadDefinitions, C>: crate::transport::BoundedPooled<C, 4>,
     super::socket_manager::SendMessage<PayloadDefinitions, C>:
         crate::transport::BoundedPooled<C, 16>,
@@ -423,6 +490,7 @@ where
             sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
+            sd_endpoint: crate::protocol::sd::SdEndpoint::DEFAULT,
             dispatch,
             timer,
             phantom: core::marker::PhantomData,
@@ -442,6 +510,7 @@ where
                     self.sd_session_id,
                     self.sd_session_has_wrapped,
                     self.multicast_loopback,
+                    self.sd_endpoint,
                 )
                 .await?;
             self.discovery_socket = Some(socket);
@@ -451,7 +520,11 @@ where
             // unicast-domain split), so don't fail the whole bind.
             match self
                 .dispatch
-                .bind_discovery_unicast(self.interface, self.e2e_registry.clone())
+                .bind_discovery_unicast(
+                    self.interface,
+                    self.e2e_registry.clone(),
+                    self.sd_endpoint.port(),
+                )
                 .await
             {
                 Ok(unicast) => self.discovery_unicast_socket = Some(unicast),
@@ -514,6 +587,31 @@ where
         }
         debug!("Bound unicast socket on port {}", bound_port);
         Ok(bound_port)
+    }
+
+    /// Where a message to `key`'s endpoint goes and the unicast socket it goes out from, bound
+    /// on demand: the endpoint's registered source port, or the first socket, or an ephemeral
+    /// one when there is none. Today's transports are IPv4 + UDP only.
+    async fn outbound(&mut self, key: ServiceEndpointKey) -> Result<(SocketAddrV4, u16), Error> {
+        let Some(endpoint_info) = self.service_registry.get(key) else {
+            return Err(Error::ServiceNotFound);
+        };
+        let desired_port = endpoint_info.local_port;
+        let (SocketAddr::V4(target), crate::TransportProtocol::Udp) =
+            (key.endpoint.addr, key.endpoint.protocol)
+        else {
+            return Err(Error::UnsupportedEndpoint(key.endpoint));
+        };
+        let source_port = if desired_port != 0 {
+            self.bind_unicast(desired_port).await?
+        } else if let Some(port) = self.unicast_sockets.keys().next() {
+            *port
+        } else {
+            let port = self.bind_unicast(0).await?;
+            debug!("Auto-bound unicast on port {} for a send", port);
+            port
+        };
+        Ok((target, source_port))
     }
 
     /// Tracks the caller's response channel against `request_id` so a
@@ -821,6 +919,25 @@ where
                         debug!("SetInterface: caller dropped the response receiver");
                     }
                 }
+                ControlMessage::SetSdEndpoint(endpoint, response) => {
+                    let rebind = self.discovery_socket.is_some();
+                    if rebind {
+                        info!("Discovery socket bound; rebinding on SD endpoint {endpoint:?}");
+                        self.unbind_discovery().await;
+                    }
+                    self.sd_endpoint = endpoint;
+                    let result = if rebind {
+                        self.bind_discovery().await
+                    } else {
+                        Ok(())
+                    };
+                    if response.send(result).is_err() {
+                        debug!("SetSdEndpoint: caller dropped the response receiver");
+                    }
+                }
+                ControlMessage::QuerySdEndpoint(response) => {
+                    let _ = response.send(Ok(self.sd_endpoint));
+                }
                 ControlMessage::BindDiscovery(response) => {
                     let result = self.bind_discovery().await;
                     if response.send(result).is_err() {
@@ -934,50 +1051,32 @@ where
                         debug!("RemoveEndpoint: caller dropped the response receiver");
                     }
                 }
+                ControlMessage::Relay {
+                    key,
+                    message,
+                    send_complete,
+                } => {
+                    let (target, source_port) = match self.outbound(key).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            let _ = send_complete.send(Err(e));
+                            return;
+                        }
+                    };
+                    let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
+                    let _ = send_complete.send(socket.send(target, message).await);
+                }
                 ControlMessage::SendToService {
                     key,
                     mut message,
                     send_complete,
                     response,
                 } => {
-                    let Some(endpoint_info) = self.service_registry.get(key) else {
-                        let _ = send_complete.send(Err(Error::ServiceNotFound));
-                        return;
-                    };
-                    let desired_port = endpoint_info.local_port;
-                    // The send target is the key's endpoint; today's
-                    // transports are IPv4 + UDP only.
-                    let (SocketAddr::V4(target), crate::TransportProtocol::Udp) =
-                        (key.endpoint.addr, key.endpoint.protocol)
-                    else {
-                        let _ = send_complete.send(Err(Error::UnsupportedEndpoint(key.endpoint)));
-                        return;
-                    };
-
-                    let source_port = if desired_port == 0 {
-                        // Ephemeral: auto-bind only if no sockets exist, then use first
-                        if self.unicast_sockets.is_empty() {
-                            match self.bind_unicast(0).await {
-                                Ok(port) => {
-                                    debug!("Auto-bound unicast on port {} for SendToService", port);
-                                    port
-                                }
-                                Err(e) => {
-                                    let _ = send_complete.send(Err(e));
-                                    return;
-                                }
-                            }
-                        } else {
-                            *self.unicast_sockets.keys().next().unwrap()
-                        }
-                    } else {
-                        // Specific port: bind if not already bound
-                        match self.bind_unicast(desired_port).await {
-                            Ok(port) => port,
-                            Err(e) => {
-                                let _ = send_complete.send(Err(e));
-                                return;
-                            }
+                    let (target, source_port) = match self.outbound(key).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            let _ = send_complete.send(Err(e));
+                            return;
                         }
                     };
                     let socket = self.unicast_sockets.get_mut(&source_port).unwrap();
@@ -1130,8 +1229,7 @@ where
                                 discovery_socket.reboot_flag(),
                             );
                             let session_id = u32::from(discovery_socket.session_id());
-                            let target =
-                                SocketAddrV4::new(*provider.ip(), protocol::sd::MULTICAST_PORT);
+                            let target = self.sd_endpoint.unicast(*provider.ip());
                             // See the SendSD arm: a downstream SD header can
                             // fail to size, and a mis-declared length is worse
                             // on the wire than a reported error.
@@ -1552,6 +1650,7 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
+            sd_endpoint: crate::protocol::sd::SdEndpoint::DEFAULT,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
@@ -1798,6 +1897,7 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             multicast_loopback: false,
+            sd_endpoint: crate::protocol::sd::SdEndpoint::DEFAULT,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner,
@@ -2588,6 +2688,7 @@ mod tests {
             sd_session_has_wrapped: false,
             e2e_registry: e2e_registry.clone(),
             multicast_loopback: false,
+            sd_endpoint: crate::protocol::sd::SdEndpoint::DEFAULT,
             dispatch: crate::client::bind_dispatch::SpawnerDispatch {
                 factory: TokioTransport,
                 spawner: TokioSpawner,
