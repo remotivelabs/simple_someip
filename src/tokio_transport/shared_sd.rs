@@ -102,7 +102,32 @@ struct Inner {
     taps: Mutex<Vec<(Origin, mpsc::Sender<Arc<Datagram>>)>>,
     /// The endpoint sockets by port, while a participant holds them.
     endpoints: tokio::sync::Mutex<HashMap<u16, Weak<Endpoint>>>,
+    /// The session id and reboot flag of every SD message sent from the unicast socket.
+    session: SdStateManager,
     workers: Workers,
+}
+
+impl Inner {
+    /// `message` with the next session id and the reboot flag of the shared socket, when it is
+    /// an SD message. A peer detects a reboot from the session ids and reboot flags of a sender
+    /// address, and the participants' own counters, interleaved, would look like one.
+    fn stamped(&self, message: &[u8]) -> Option<Vec<u8>> {
+        const SD_MESSAGE_ID: [u8; 4] = [0xFF, 0xFF, 0x81, 0x00];
+        const FLAGS: usize = 16;
+        const REBOOT: u8 = 0x80;
+        if message.len() <= FLAGS || message[..4] != SD_MESSAGE_ID {
+            return None;
+        }
+        let (request_id, reboot) = self.session.next_session_id_with_reboot_flag();
+        let mut stamped = message.to_vec();
+        stamped[8..12].copy_from_slice(&request_id.to_be_bytes());
+        if bool::from(reboot) {
+            stamped[FLAGS] |= REBOOT;
+        } else {
+            stamped[FLAGS] &= !REBOOT;
+        }
+        Some(stamped)
+    }
 }
 
 /// The receive workers of the sockets' owner, cancelled when it drops. A worker holds its owner
@@ -234,6 +259,7 @@ impl SharedSd {
             endpoint,
             taps: Mutex::new(Vec::new()),
             endpoints: tokio::sync::Mutex::new(HashMap::new()),
+            session: SdStateManager::new(),
             workers: Workers::default(),
         });
         for origin in [Origin::Unicast, Origin::Multicast] {
@@ -612,8 +638,15 @@ impl TransportSocket for SharedTap {
     type SendFuture<'a> = BoxedFuture<'a, Result<(), TransportError>>;
     type RecvFuture<'a> = BoxedFuture<'a, Result<ReceivedDatagram, TransportError>>;
 
+    /// Sends `buf` from the unicast socket; an SD message with the socket's session id and
+    /// reboot flag in place of the participant's.
     fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddrV4) -> Self::SendFuture<'a> {
-        Box::pin(self.inner.unicast.send_to(buf, target))
+        match self.inner.stamped(buf) {
+            Some(stamped) => {
+                Box::pin(async move { self.inner.unicast.send_to(&stamped, target).await })
+            }
+            None => Box::pin(self.inner.unicast.send_to(buf, target)),
+        }
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFuture<'a> {
@@ -984,6 +1017,57 @@ mod tests {
         assert!(bind_alone(port).is_ok(), "the endpoint socket is closed");
         drop(tap);
         assert!(bind_alone(PORT + 6).is_ok(), "the SD sockets are closed");
+    }
+
+    /// An SD message's first 17 bytes: the header with `session`, and the flags with the
+    /// reboot flag as `rebooted`.
+    fn sd_message(session: u16, rebooted: bool) -> Vec<u8> {
+        let mut bytes = std::vec![0xFF, 0xFF, 0x81, 0x00, 0, 0, 0, 12, 0, 0];
+        bytes.extend_from_slice(&session.to_be_bytes());
+        bytes.extend_from_slice(&[1, 1, 0x02, 0x00]);
+        bytes.extend_from_slice(&[if rebooted { 0xC0 } else { 0x40 }, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn the_participants_sd_messages_carry_one_session() {
+        let endpoint = SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 243), PORT + 10).unwrap();
+        let shared = SharedSd::bind(Ipv4Addr::LOCALHOST, endpoint, true)
+            .await
+            .unwrap();
+        let server = shared.tap(Origin::Both);
+        let client = shared.tap(Origin::Unicast);
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0))
+            .await
+            .unwrap();
+        let std::net::SocketAddr::V4(peer_addr) = peer.local_addr().unwrap() else {
+            unreachable!()
+        };
+
+        server
+            .send_to(&sd_message(5, false), peer_addr)
+            .await
+            .unwrap();
+        client
+            .send_to(&sd_message(120, false), peer_addr)
+            .await
+            .unwrap();
+        server.send_to(b"no SD message", peer_addr).await.unwrap();
+
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let mut buf = [0u8; 64];
+            let (n, _) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 24);
+            assert_eq!(buf[16] & 0x80, 0x80, "a fresh socket has recently rebooted");
+            assert_eq!(buf[16] & 0x40, 0x40, "the other flags are kept");
+            sessions.push(u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]));
+        }
+        assert_eq!(sessions[1], sessions[0] + 1);
+        let mut buf = [0u8; 64];
+        let (n, _) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"no SD message");
     }
 
     #[test]
