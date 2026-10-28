@@ -802,7 +802,7 @@ mod tests {
     use super::*;
 
     /// A port no other test binds, so the taps see this test's datagrams alone.
-    const PORT: u16 = 30497;
+    const PORT: u16 = 31497;
 
     async fn next<T: TransportSocket>(tap: &T) -> (Vec<u8>, SocketAddrV4) {
         let mut buf = [0u8; 64];
