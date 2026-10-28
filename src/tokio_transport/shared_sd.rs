@@ -11,14 +11,15 @@
 //!
 //! A server is served through [`SharedSd::serve`], which gives it a tap of both origins for its
 //! SD socket. A client takes [`SharedSd::transport`] as its factory: the discovery bind on the
-//! unspecified address gets a multicast tap, the one on the interface a unicast tap, and every
-//! other bind its own socket.
+//! unspecified address gets a multicast tap, the one on the interface a unicast tap, a bind on
+//! a fixed port an endpoint tap, and a bind on port 0 its own socket.
 //!
 //! The endpoint sockets are shared too, as different services share one port
 //! (`feat_req_someip_445`): every server served on a `local_port` takes an [`EndpointTap`] on the
-//! port's socket, which receives the requests to its service, and a client bind on that port
-//! takes one for the responses and events of the services it consumes. Two instances of one service listen on different ports (`feat_req_someip_648`), so a
-//! second one on a port is refused.
+//! interface's socket on that port, which receives the requests to its service, and a client
+//! bind on the port takes one for the responses and events of the services it consumes,
+//! whichever comes first. Two instances of one service listen on different ports
+//! (`feat_req_someip_648`), so a second one on a port is refused.
 
 use std::boxed::Box;
 use std::collections::HashMap;
@@ -719,9 +720,9 @@ impl TransportSocket for SharedSocket {
 }
 
 /// A transport factory over the shared sockets: a bind on the SD port is a tap, a multicast one
-/// on the unspecified address and a unicast one on an interface; a bind on a port a server is
-/// served on is a tap of that endpoint socket, for the messages of the services none of them
-/// serves; any other bind is a socket of its own.
+/// on the unspecified address and a unicast one on an interface; a bind on another fixed port is
+/// a tap of the interface's endpoint socket on that port, for the responses and events of the
+/// services the client consumes; a bind on port 0 is a socket of its own.
 #[derive(Clone)]
 pub struct SharedTransport {
     shared: SharedSd,
@@ -742,10 +743,12 @@ impl TransportFactory for SharedTransport {
                 return Ok(SharedSocket::Tap(self.shared.tap(origin)));
             }
             if addr.port() != 0 {
-                let endpoints = self.shared.inner.endpoints.lock().await;
-                if let Some(endpoint) = endpoints.get(&addr.port()).and_then(Weak::upgrade) {
-                    return endpoint.tap(Serves::Rest).map(SharedSocket::Endpoint);
-                }
+                return self
+                    .shared
+                    .endpoint_socket(addr.port())
+                    .await?
+                    .tap(Serves::Rest)
+                    .map(SharedSocket::Endpoint);
             }
             TokioTransport
                 .bind(addr, options)
@@ -899,6 +902,36 @@ mod tests {
         );
         assert_eq!(
             one.local_addr().unwrap(),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_is_served_on_a_port_a_client_bound_first() {
+        let endpoint = SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 244), PORT + 8).unwrap();
+        let shared = SharedSd::bind(Ipv4Addr::LOCALHOST, endpoint, true)
+            .await
+            .unwrap();
+        let port = PORT + 9;
+        let client = shared
+            .transport()
+            .bind(
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
+                &SocketOptions::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(client, SharedSocket::Endpoint(_)));
+
+        let server = shared
+            .endpoint_socket(port)
+            .await
+            .unwrap()
+            .tap(Serves::Service(1))
+            .expect("the server taps the client's socket");
+
+        assert_eq!(
+            server.local_addr().unwrap(),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
         );
     }
