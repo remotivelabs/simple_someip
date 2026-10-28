@@ -624,10 +624,15 @@ impl TransportSocket for SharedTap {
         self.inner.unicast.local_addr()
     }
 
-    /// The shared multicast socket joined the SD group when it was bound; nothing else is
-    /// joined through a tap.
-    fn join_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
-        Ok(())
+    /// The shared multicast socket joined the SD group on the interface when it was bound;
+    /// joining that again is a no-op, and any other group or interface is
+    /// [`TransportError::Unsupported`], as the tap could not receive it.
+    fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> Result<(), TransportError> {
+        if group == self.inner.endpoint.group() && iface == self.inner.interface {
+            Ok(())
+        } else {
+            Err(TransportError::Unsupported)
+        }
     }
 
     fn leave_multicast_v4(&self, _group: Ipv4Addr, _iface: Ipv4Addr) -> Result<(), TransportError> {
@@ -1014,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tap_sends_from_the_shared_unicast_socket() {
+    async fn a_tap_sends_from_the_shared_unicast_socket_and_joins_only_its_group() {
         let endpoint = SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 250), PORT + 1).unwrap();
         let shared = SharedSd::bind(Ipv4Addr::LOCALHOST, endpoint, true)
             .await
@@ -1027,6 +1032,14 @@ mod tests {
             unreachable!()
         };
 
+        assert!(
+            tap.join_multicast_v4(endpoint.group(), Ipv4Addr::LOCALHOST)
+                .is_ok()
+        );
+        assert!(matches!(
+            tap.join_multicast_v4(Ipv4Addr::new(239, 255, 0, 1), Ipv4Addr::LOCALHOST),
+            Err(TransportError::Unsupported)
+        ));
         tap.send_to(b"offer", peer_addr).await.unwrap();
 
         let mut buf = [0u8; 64];
