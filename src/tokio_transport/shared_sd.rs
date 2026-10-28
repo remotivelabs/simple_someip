@@ -331,10 +331,10 @@ impl SharedSd {
     }
 
     /// Serve a service through the shared sockets: the server's SD socket is a tap of both
-    /// origins, and its unicast socket the interface's endpoint socket on `config.local_port`,
-    /// shared with the other services served there and a client consuming through it; on port
-    /// 0 it is a socket of its own. `config`'s interface and SD endpoint are the shared
-    /// sockets'.
+    /// origins, on which it leaves the subscriptions to other services to their servers, and its
+    /// unicast socket the interface's endpoint socket on `config.local_port`, shared with the
+    /// other services served there and a client consuming through it; on port 0 it is a socket
+    /// of its own. `config`'s interface and SD endpoint are the shared sockets'.
     ///
     /// # Errors
     ///
@@ -360,7 +360,8 @@ impl SharedSd {
     {
         let config = config
             .with_interface(self.inner.interface)
-            .with_sd_endpoint(self.inner.endpoint);
+            .with_sd_endpoint(self.inner.endpoint)
+            .with_other_services_nacked(false);
         let unicast_socket = if config.local_port == 0 {
             SharedSocket::Own(
                 TokioTransport

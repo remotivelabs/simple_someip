@@ -277,6 +277,17 @@ where
                     entry_view.major_version(),
                     entry_view.event_group_id(),
                 );
+                let offered = co_offered
+                    || (entry_view.service_id() == config.service_id
+                        && entry_view.instance_id() == config.instance_id);
+                if !offered && !config.nack_other_services {
+                    crate::log::trace!(
+                        "Subscribe for service 0x{:04X} instance {} is left to its server",
+                        entry_view.service_id(),
+                        entry_view.instance_id()
+                    );
+                    continue;
+                }
 
                 if !co_offered && entry_view.service_id() != config.service_id {
                     crate::log::warn!(

@@ -113,6 +113,13 @@ pub struct ServerConfig {
     /// Where SD messages are exchanged: the group this server joins and announces on, and the
     /// port it binds for SD. [`SdEndpoint::DEFAULT`] unless configured otherwise.
     pub sd_endpoint: SdEndpoint,
+    /// Whether a `SubscribeEventgroup` for a service or instance this server does not offer is
+    /// answered with a `SubscribeEventgroupNack`. Defaults to `true`.
+    ///
+    /// Set to `false` (via [`Self::with_other_services_nacked`]) when servers share one SD
+    /// socket: each of them receives every subscription, and the one offering the service
+    /// answers it, so the others must not refuse it.
+    pub nack_other_services: bool,
     /// Additional co-offered `(service, instance, event_group)` tuples this
     /// receive loop accepts `SubscribeEventGroup` for, beyond its own
     /// `(service_id, instance_id, event_group_ids)`.
@@ -211,6 +218,7 @@ impl ServerConfig {
             event_group_ids: heapless::Vec::new(),
             announce: true,
             sd_endpoint: SdEndpoint::DEFAULT,
+            nack_other_services: true,
             accepted_offers: heapless::Vec::new(),
         }
     }
@@ -415,6 +423,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_sd_endpoint(mut self, sd_endpoint: SdEndpoint) -> Self {
         self.sd_endpoint = sd_endpoint;
+        self
+    }
+
+    /// Set whether a subscription to a service or instance this server does not offer is
+    /// refused. Defaults to `true`; see [`Self::nack_other_services`].
+    #[must_use]
+    pub fn with_other_services_nacked(mut self, nack: bool) -> Self {
+        self.nack_other_services = nack;
         self
     }
 }
@@ -2480,6 +2496,62 @@ mod tests {
         assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={ttl}");
 
         server_handle.await.unwrap();
+    }
+
+    /// A server sharing its SD socket leaves a subscription to another service or instance
+    /// to the server offering it: no Nack.
+    #[tokio::test]
+    async fn test_subscribe_to_another_service_is_not_nacked_when_told_so() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        server.config.nack_other_services = false;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for (service, instance) in [(0x99, 1), (0x5B, 2)] {
+            let message = make_subscription_header(
+                service,
+                instance,
+                1,
+                3,
+                0x01,
+                Ipv4Addr::LOCALHOST,
+                sd::TransportProtocol::Udp,
+                server_port,
+            );
+            client_socket
+                .send_to(&message, format!("127.0.0.1:{server_port}"))
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..2 {
+            let mut buf = vec![0u8; 65535];
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let addr = core::net::SocketAddr::V4(datagram.source);
+            let view = MessageView::parse(&buf[..datagram.bytes_received]).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut resp_buf = vec![0u8; 65535];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client_socket.recv_from(&mut resp_buf),
+            )
+            .await
+            .is_err(),
+            "no answer to a subscription the server does not offer"
+        );
+        assert_eq!(server.subscriptions.read().await.subscription_count(), 0);
     }
 
     #[tokio::test]
