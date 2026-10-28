@@ -16,9 +16,8 @@
 //!
 //! The endpoint sockets are shared too, as different services share one port
 //! (`feat_req_someip_445`): every server served on a `local_port` takes an [`EndpointTap`] on the
-//! port's socket, which receives the messages of its service, and a client bind on that port
-//! takes one for the messages of the rest, the responses and events of the services it
-//! consumes. Two instances of one service listen on different ports (`feat_req_someip_648`), so a
+//! port's socket, which receives the requests to its service, and a client bind on that port
+//! takes one for the responses and events of the services it consumes. Two instances of one service listen on different ports (`feat_req_someip_648`), so a
 //! second one on a port is refused.
 
 use std::boxed::Box;
@@ -88,11 +87,18 @@ struct Inner {
 /// Which messages a tap on an endpoint socket receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Serves {
-    /// One service's: a server's.
+    /// The requests to one service: a server's.
     Service(u16),
-    /// Those of no service served on the socket: a client's, the responses and events of the
-    /// services it consumes.
+    /// The responses, errors and events: a client's, of the services it consumes.
     Rest,
+}
+
+/// What an endpoint socket hands on: a message with its service, and whether it is a request,
+/// which goes to the service's server, or a response, error or event, which goes to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Addressed {
+    service: u16,
+    request: bool,
 }
 
 /// One endpoint socket of the interface, shared by the servers and the client on its port.
@@ -361,9 +367,8 @@ async fn fan_out(inner: Weak<Inner>, from: Origin) {
     }
 }
 
-/// Every datagram an endpoint socket receives, message by message: each to the tap serving the
-/// message's service, else to the taps of the rest, else to the first tap, so that one server
-/// answers for an unknown service. Ends once the socket is gone.
+/// Every datagram an endpoint socket receives, message by message, each to its [`takers`]. Ends
+/// once the socket is gone.
 async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
     let mut buf = std::vec![0u8; MAX_DATAGRAM];
     loop {
@@ -382,12 +387,12 @@ async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         taps.retain(|(_, tap)| !tap.is_closed());
-        for (service, bytes) in messages(&buf[..received.bytes_received]) {
+        for (addressed, bytes) in messages(&buf[..received.bytes_received]) {
             let datagram = Arc::new(Datagram {
                 bytes: bytes.to_vec(),
                 source: received.source,
             });
-            for tap in takers(&taps, service) {
+            for tap in takers(&taps, addressed) {
                 if let Err(mpsc::error::TrySendError::Full(_)) = tap.try_send(Arc::clone(&datagram))
                 {
                     crate::log::warn!(
@@ -400,33 +405,55 @@ async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
     }
 }
 
-/// The taps a message of `service` goes to.
+/// The taps a message goes to. A request goes to the server of its service, else to any server,
+/// so that one answers for an unknown service. A response, error or event goes to the clients,
+/// so that a client consuming a service that a server on the port offers too gets its answers.
+/// What is no message goes to the clients. A message no tap of its kind takes goes to the
+/// first tap.
 fn takers(
     taps: &[(Serves, mpsc::Sender<Arc<Datagram>>)],
-    service: Option<u16>,
+    addressed: Option<Addressed>,
 ) -> Vec<&mpsc::Sender<Arc<Datagram>>> {
-    let served = service.and_then(|id| {
+    let of = |wanted: &dyn Fn(Serves) -> bool| -> Vec<_> {
         taps.iter()
-            .find(|(serves, _)| *serves == Serves::Service(id))
-    });
-    if let Some((_, tap)) = served {
-        return std::vec![tap];
-    }
-    let rest: Vec<_> = taps
-        .iter()
-        .filter(|(serves, _)| *serves == Serves::Rest)
-        .map(|(_, tap)| tap)
-        .collect();
-    if rest.is_empty() {
+            .filter(|(serves, _)| wanted(*serves))
+            .map(|(_, tap)| tap)
+            .collect()
+    };
+    let chosen = match addressed {
+        Some(Addressed {
+            service,
+            request: true,
+        }) => {
+            let served = of(&|serves| serves == Serves::Service(service));
+            if served.is_empty() {
+                of(&|serves| serves != Serves::Rest)
+                    .into_iter()
+                    .take(1)
+                    .collect()
+            } else {
+                served
+            }
+        }
+        _ => of(&|serves| serves == Serves::Rest),
+    };
+    if chosen.is_empty() {
         taps.first().map(|(_, tap)| tap).into_iter().collect()
     } else {
-        rest
+        chosen
     }
 }
 
-/// The SOME/IP messages of a datagram, each with its service id: a header's length counts the
-/// bytes behind its first eight. What does not parse as one is one message of no service.
-fn messages(datagram: &[u8]) -> Vec<(Option<u16>, &[u8])> {
+/// The message type values of a request: `REQUEST` and `REQUEST_NO_RETURN`, alone or with the
+/// TP flag.
+fn is_request(message_type: u8) -> bool {
+    matches!(message_type & !0x20, 0x00 | 0x01)
+}
+
+/// The SOME/IP messages of a datagram, each with where it goes: a header's length counts the
+/// bytes behind its first eight. What does not parse as one is one message going nowhere in
+/// particular.
+fn messages(datagram: &[u8]) -> Vec<(Option<Addressed>, &[u8])> {
     let mut messages = Vec::new();
     let mut rest = datagram;
     while !rest.is_empty() {
@@ -439,7 +466,11 @@ fn messages(datagram: &[u8]) -> Vec<(Option<u16>, &[u8])> {
         match size {
             Some(size) if size >= 16 && size <= rest.len() => {
                 let (message, behind) = rest.split_at(size);
-                messages.push((Some(u16::from_be_bytes([message[0], message[1]])), message));
+                let addressed = Addressed {
+                    service: u16::from_be_bytes([message[0], message[1]]),
+                    request: is_request(message[14]),
+                };
+                messages.push((Some(addressed), message));
                 rest = behind;
             }
             _ => {
@@ -681,12 +712,17 @@ mod tests {
         );
     }
 
-    /// A SOME/IP message of `service`, method 1, with `payload`.
+    /// A SOME/IP request to `service`, method 1, with `payload`.
     fn message(service: u16, payload: &[u8]) -> Vec<u8> {
+        typed(service, 0x00, payload)
+    }
+
+    /// A SOME/IP message of `service`, method 1, of `message_type`, with `payload`.
+    fn typed(service: u16, message_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut bytes = service.to_be_bytes().to_vec();
         bytes.extend_from_slice(&[0, 1]);
         bytes.extend_from_slice(&(8 + u32::try_from(payload.len()).unwrap()).to_be_bytes());
-        bytes.extend_from_slice(&[0, 0, 0, 1, 1, 1, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 1, 1, 1, message_type, 0]);
         bytes.extend_from_slice(payload);
         bytes
     }
@@ -742,6 +778,8 @@ mod tests {
         };
         let mut datagram = message(1, b"one");
         datagram.extend(message(2, b"two"));
+        datagram.extend(typed(1, 0x80, b"answer"));
+        datagram.extend(typed(2, 0x02, b"event"));
         datagram.extend(message(9, b"nine"));
         peer.send_to(&datagram, (Ipv4Addr::LOCALHOST, port))
             .await
@@ -749,7 +787,17 @@ mod tests {
 
         assert_eq!(next(&one).await, (message(1, b"one"), from));
         assert_eq!(next(&two).await, (message(2, b"two"), from));
-        assert_eq!(next(&rest).await, (message(9, b"nine"), from));
+        assert_eq!(
+            next(&rest).await,
+            (typed(1, 0x80, b"answer"), from),
+            "a response goes to the client, though a server on the port offers its service"
+        );
+        assert_eq!(next(&rest).await, (typed(2, 0x02, b"event"), from));
+        assert_eq!(
+            next(&one).await,
+            (message(9, b"nine"), from),
+            "a request to a service no one serves goes to a server"
+        );
         assert_eq!(
             one.local_addr().unwrap(),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
@@ -757,14 +805,20 @@ mod tests {
     }
 
     #[test]
-    fn what_is_no_message_is_one_message_of_no_service() {
+    fn what_is_no_message_is_one_message_going_nowhere_in_particular() {
         assert_eq!(messages(b"short"), std::vec![(None, b"short".as_slice())]);
         let mut datagram = message(3, b"x");
         datagram.extend_from_slice(b"junk");
         assert_eq!(
             messages(&datagram),
             std::vec![
-                (Some(3), message(3, b"x").as_slice()),
+                (
+                    Some(Addressed {
+                        service: 3,
+                        request: true
+                    }),
+                    message(3, b"x").as_slice()
+                ),
                 (None, b"junk".as_slice())
             ]
         );
