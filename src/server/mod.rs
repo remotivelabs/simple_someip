@@ -8,6 +8,7 @@
 
 mod error;
 mod event_publisher;
+mod request;
 mod runtime;
 mod sd_state;
 mod service_info;
@@ -15,6 +16,13 @@ mod subscription_manager;
 
 pub use error::Error;
 pub use event_publisher::EventPublisher;
+#[cfg(feature = "_alloc")]
+pub use request::OwnedRequest;
+#[cfg(feature = "server-tokio")]
+pub use request::RequestSender;
+pub use request::{
+    ExceptionWithoutError, Reply, Request, RequestObserver, RequestObserverHandle, ResponseTarget,
+};
 pub use service_info::Subscriber;
 #[cfg(feature = "std")]
 pub use service_info::{EventGroupInfo, ServiceInfo};
@@ -28,8 +36,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Timer;
 use crate::e2e::{E2EKey, E2EProfile};
-#[cfg(feature = "_alloc")]
-use crate::protocol::sd;
+use crate::protocol::sd::SdEndpoint;
 #[cfg(feature = "_alloc")]
 use crate::transport::SocketOptions;
 #[cfg(feature = "_alloc")]
@@ -103,6 +110,16 @@ pub struct ServerConfig {
     /// stay silent on SD. Has no effect on passive servers, which never
     /// announce.
     pub announce: bool,
+    /// Where SD messages are exchanged: the group this server joins and announces on, and the
+    /// port it binds for SD. [`SdEndpoint::DEFAULT`] unless configured otherwise.
+    pub sd_endpoint: SdEndpoint,
+    /// Whether a `SubscribeEventgroup` for a service or instance this server does not offer is
+    /// answered with a `SubscribeEventgroupNack`. Defaults to `true`.
+    ///
+    /// Set to `false` (via [`Self::with_other_services_nacked`]) when servers share one SD
+    /// socket: each of them receives every subscription, and the one offering the service
+    /// answers it, so the others must not refuse it.
+    pub nack_other_services: bool,
     /// Additional co-offered `(service, instance, event_group)` tuples this
     /// receive loop accepts `SubscribeEventGroup` for, beyond its own
     /// `(service_id, instance_id, event_group_ids)`.
@@ -200,6 +217,8 @@ impl ServerConfig {
             ttl: 3, // 3 seconds is typical for SOME/IP
             event_group_ids: heapless::Vec::new(),
             announce: true,
+            sd_endpoint: SdEndpoint::DEFAULT,
+            nack_other_services: true,
             accepted_offers: heapless::Vec::new(),
         }
     }
@@ -399,6 +418,21 @@ impl ServerConfig {
         self.announce = announce;
         self
     }
+
+    /// Exchange SD messages on `sd_endpoint` instead of the standard group and port.
+    #[must_use]
+    pub fn with_sd_endpoint(mut self, sd_endpoint: SdEndpoint) -> Self {
+        self.sd_endpoint = sd_endpoint;
+        self
+    }
+
+    /// Set whether a subscription to a service or instance this server does not offer is
+    /// refused. Defaults to `true`; see [`Self::nack_other_services`].
+    #[must_use]
+    pub fn with_other_services_nacked(mut self, nack: bool) -> Self {
+        self.nack_other_services = nack;
+        self
+    }
 }
 
 /// Bundle of pluggable infrastructure passed to `Server::new_with_deps`.
@@ -435,6 +469,9 @@ where
     /// and the source `SocketAddrV4`; the consumer is responsible for
     /// re-parsing the SOME/IP header and any E2E check.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`]. `None` observes none.
+    pub request_observer: Option<RequestObserverHandle>,
 }
 
 /// Tokio-defaulted constructor.
@@ -480,6 +517,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         }
     }
 }
@@ -505,6 +543,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -517,6 +556,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -532,6 +572,7 @@ where
             e2e_registry,
             subscriptions: self.subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -547,6 +588,7 @@ where
             e2e_registry: self.e2e_registry,
             subscriptions,
             non_sd_observer: self.non_sd_observer,
+            request_observer: self.request_observer,
         }
     }
 
@@ -560,6 +602,18 @@ where
     #[must_use]
     pub fn with_non_sd_observer(mut self, observer: Option<(NonSdRequestCallback, usize)>) -> Self {
         self.non_sd_observer = observer;
+        self
+    }
+
+    /// Tell `observer` about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`].
+    #[cfg(feature = "_alloc")]
+    #[must_use]
+    pub fn with_request_observer(
+        mut self,
+        observer: impl RequestObserver + Send + Sync + 'static,
+    ) -> Self {
+        self.request_observer = Some(Arc::new(observer));
         self
     }
 }
@@ -667,6 +721,9 @@ where
     /// (method requests). `None` reproduces the default "non-SD
     /// ignored" behavior.
     pub non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service, to answer later through
+    /// [`EventPublisher::respond_with_buffers`]. `None` observes none.
+    pub request_observer: Option<RequestObserverHandle>,
 }
 
 /// SOME/IP Server that can offer services and publish events.
@@ -780,6 +837,8 @@ pub struct Server<
     /// surfaces those datagrams to the consumer (used by halo's FFI to
     /// dispatch HWP1 method requests).
     non_sd_observer: Option<(NonSdRequestCallback, usize)>,
+    /// Told about every request to an offered service; see [`RequestObserver`].
+    request_observer: Option<RequestObserverHandle>,
 }
 
 /// Callback invoked by the server's `recv_loop` for every non-SD
@@ -935,6 +994,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         };
         Self::new_with_deps(deps, config, multicast_loopback).await
     }
@@ -976,6 +1036,7 @@ impl
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionManager::new())),
             non_sd_observer: None,
+            request_observer: None,
         };
         Self::new_passive_with_deps(deps, config).await
     }
@@ -1030,6 +1091,7 @@ where
             e2e_registry,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         } = deps;
 
         // Bind unicast socket for receiving subscriptions, then wrap
@@ -1051,21 +1113,21 @@ where
             config.service_id
         );
 
-        // Bind SD socket for sending/receiving SD messages (must use SD port 30490).
+        // Bind SD socket for sending/receiving SD messages, on the configured SD port.
         let mut sd_opts = SocketOptions::new();
         sd_opts.reuse_address = true;
         sd_opts.reuse_port = true;
         sd_opts.multicast_if_v4 = Some(config.interface);
         sd_opts.multicast_loop_v4 = Some(multicast_loopback);
-        let sd_addr = SocketAddrV4::new(config.interface, sd::MULTICAST_PORT);
+        let sd_addr = SocketAddrV4::new(config.interface, config.sd_endpoint.port());
         let sd_raw = factory.bind(sd_addr, &sd_opts).await?;
-        sd_raw.join_multicast_v4(sd::MULTICAST_IP, config.interface)?;
+        sd_raw.join_multicast_v4(config.sd_endpoint.group(), config.interface)?;
         let sd_socket: H = H::wrap(sd_raw);
         crate::log::info!(
             "Server SD socket bound to {} (expected port {}), joined multicast {}",
             sd_addr,
-            sd::MULTICAST_PORT,
-            sd::MULTICAST_IP
+            config.sd_endpoint.port(),
+            config.sd_endpoint.group()
         );
 
         let publisher = Hep::wrap(EventPublisher::new(
@@ -1087,6 +1149,7 @@ where
             is_passive: false,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1123,6 +1186,7 @@ where
             e2e_registry,
             subscriptions,
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         } = deps;
 
         // Bind unicast socket at the configured local_port.
@@ -1171,6 +1235,7 @@ where
             is_passive: true,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: deps_non_sd_observer,
+            request_observer: deps_request_observer,
         };
         let handles = ServerHandles {
             publisher: server.publisher(),
@@ -1256,6 +1321,7 @@ where
             is_passive: false,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
+            request_observer: deps.request_observer,
         })
     }
 
@@ -1322,6 +1388,7 @@ where
             is_passive: true,
             started: deps.started,
             non_sd_observer: deps.non_sd_observer,
+            request_observer: deps.request_observer,
         })
     }
 
@@ -1429,6 +1496,8 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
+        #[allow(clippy::clone_on_copy)]
+        let request_observer = self.request_observer.clone();
         #[allow(noop_method_call)]
         let started = self.started.clone();
 
@@ -1448,7 +1517,7 @@ where
                 return Err(Error::InvalidUsage("server_already_running"));
             }
 
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R, _>(
                 config,
                 unicast_socket,
                 sd_socket,
@@ -1462,6 +1531,7 @@ where
                 recv_send_buf,
                 announce_send_buf,
                 non_sd_observer,
+                request::observer(request_observer.as_ref()),
             )
             .await
         }
@@ -1650,6 +1720,7 @@ where
         let timer = self.timer.clone();
         let is_passive = self.is_passive;
         let non_sd_observer = self.non_sd_observer;
+        let request_observer = self.request_observer.clone();
         let started = self.started.clone();
 
         async move {
@@ -1681,7 +1752,7 @@ where
             // callers pass their own via `run_with_buffers`.
             let mut recv_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
             let mut announce_send_buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
-            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R>(
+            runtime::run_combined::<H, F::Socket, Sub, Hsd, Tm, R, _>(
                 config,
                 unicast_socket,
                 sd_socket,
@@ -1695,6 +1766,7 @@ where
                 &mut recv_send_buf,
                 &mut announce_send_buf,
                 non_sd_observer,
+                request::observer(request_observer.as_ref()),
             )
             .await
         }
@@ -1704,6 +1776,7 @@ where
 #[cfg(all(test, feature = "server-tokio"))]
 mod tests {
     use super::*;
+    use crate::protocol::sd;
     use crate::protocol::sd::{Entry, Flags, ServiceEntry};
     use crate::protocol::{
         Header as SomeIpHeader, MessageType, MessageTypeField, MessageView, ReturnCode,
@@ -1884,6 +1957,7 @@ mod tests {
             publisher,
             started: Arc::new(AtomicBool::new(false)),
             non_sd_observer: None,
+            request_observer: None,
         };
         (handles, bound_port)
     }
@@ -2125,6 +2199,7 @@ mod tests {
             e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
             subscriptions: subscriptions.clone(),
             non_sd_observer: None,
+            request_observer: None,
         };
         let config = ServerConfig::new(0x5B, 1)
             .with_interface(Ipv4Addr::LOCALHOST)
@@ -2421,6 +2496,62 @@ mod tests {
         assert_eq!(ttl, 0, "Expected NACK (TTL=0), got TTL={ttl}");
 
         server_handle.await.unwrap();
+    }
+
+    /// A server sharing its SD socket leaves a subscription to another service or instance
+    /// to the server offering it: no Nack.
+    #[tokio::test]
+    async fn test_subscribe_to_another_service_is_not_nacked_when_told_so() {
+        let (mut server, server_port) = create_test_server(0x5B, 1).await;
+        server.config.nack_other_services = false;
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for (service, instance) in [(0x99, 1), (0x5B, 2)] {
+            let message = make_subscription_header(
+                service,
+                instance,
+                1,
+                3,
+                0x01,
+                Ipv4Addr::LOCALHOST,
+                sd::TransportProtocol::Udp,
+                server_port,
+            );
+            client_socket
+                .send_to(&message, format!("127.0.0.1:{server_port}"))
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..2 {
+            let mut buf = vec![0u8; 65535];
+            let datagram = server.unicast_socket.recv_from(&mut buf).await.unwrap();
+            let addr = core::net::SocketAddr::V4(datagram.source);
+            let view = MessageView::parse(&buf[..datagram.bytes_received]).unwrap();
+            let sd_view = view.sd_header().unwrap();
+            runtime::handle_sd_message(
+                &server.config,
+                server.sd_socket.get(),
+                server.sd_state.get(),
+                &server.subscriptions,
+                &sd_view,
+                addr,
+                &mut [0u8; crate::UDP_BUFFER_SIZE],
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut resp_buf = vec![0u8; 65535];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                client_socket.recv_from(&mut resp_buf),
+            )
+            .await
+            .is_err(),
+            "no answer to a subscription the server does not offer"
+        );
+        assert_eq!(server.subscriptions.read().await.subscription_count(), 0);
     }
 
     #[tokio::test]

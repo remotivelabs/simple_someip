@@ -191,6 +191,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: sd::SdEndpoint,
     ) -> Result<Self, Error> {
         use crate::tokio_transport::{TokioBufferProvider, TokioSpawner, TokioTransport};
         use crate::transport::BufferProvider;
@@ -205,6 +206,7 @@ where
             session_id,
             session_has_wrapped,
             multicast_loopback,
+            sd_endpoint,
             buf,
         )
         .await
@@ -252,6 +254,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: sd::SdEndpoint,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -281,17 +284,17 @@ where
             o.multicast_loop_v4 = Some(multicast_loopback);
             o
         };
-        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd_endpoint.port());
 
         let socket = factory.bind(bind_addr, &options).await?;
-        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
+        socket.join_multicast_v4(sd_endpoint.group(), interface)?;
 
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: sd::MULTICAST_PORT,
+            local_port: sd_endpoint.port(),
             session_id: session_id.max(1),
             session_has_wrapped,
         })
@@ -310,6 +313,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: sd::SdEndpoint,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -328,15 +332,15 @@ where
             o.multicast_loop_v4 = Some(multicast_loopback);
             o
         };
-        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd::MULTICAST_PORT);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, sd_endpoint.port());
         let socket = factory.bind(bind_addr, &options).await?;
-        socket.join_multicast_v4(sd::MULTICAST_IP, interface)?;
+        socket.join_multicast_v4(sd_endpoint.group(), interface)?;
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: sd::MULTICAST_PORT,
+            local_port: sd_endpoint.port(),
             session_id: session_id.max(1),
             session_has_wrapped,
         })
@@ -362,6 +366,7 @@ where
         spawner: &S,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -384,14 +389,14 @@ where
         };
         // Specific-IP bind (vs the multicast socket's `INADDR_ANY`) is what
         // makes the kernel divert unicast SD here.
-        let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
+        let bind_addr = SocketAddrV4::new(interface, sd_port);
         let socket = factory.bind(bind_addr, &options).await?;
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: sd::MULTICAST_PORT,
+            local_port: sd_port,
             session_id: 1,
             session_has_wrapped: false,
         })
@@ -404,6 +409,7 @@ where
         spawner: &S,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
         buf: BufferLease,
     ) -> Result<Self, Error>
     where
@@ -420,14 +426,14 @@ where
             o.reuse_port = true;
             o
         };
-        let bind_addr = SocketAddrV4::new(interface, sd::MULTICAST_PORT);
+        let bind_addr = SocketAddrV4::new(interface, sd_port);
         let socket = factory.bind(bind_addr, &options).await?;
         let fut = Self::socket_loop_future(socket, rx_tx, tx_rx, e2e_registry, buf);
         spawner.spawn_local(fut);
         Ok(Self {
             receiver: rx_rx,
             sender: tx_tx,
-            local_port: sd::MULTICAST_PORT,
+            local_port: sd_port,
             session_id: 1,
             session_has_wrapped: false,
         })
@@ -1443,6 +1449,7 @@ mod tests {
             0,
             false,
             false,
+            sd::SdEndpoint::DEFAULT,
         )
         .await
         .unwrap();
