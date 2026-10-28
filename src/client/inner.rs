@@ -1072,6 +1072,11 @@ where
                     send_complete,
                     response,
                 } => {
+                    let client_id = (message.header().request_id() >> 16) as u16;
+                    if client_id == self.client_id {
+                        let _ = send_complete.send(Err(Error::OwnClientId(client_id)));
+                        return;
+                    }
                     let (target, source_port) = match self.outbound(key).await {
                         Ok(found) => found,
                         Err(e) => {

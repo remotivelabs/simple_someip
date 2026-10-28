@@ -61,6 +61,10 @@ pub enum Error {
     /// its driver and further calls on it cannot make progress.
     #[error("client run loop is no longer running")]
     Shutdown,
+    /// A relayed message carries this client's own client id. The client's own requests
+    /// use it, so a reply to the relay could not be told from a reply to one of them.
+    #[error("relayed message carries the client's own client id 0x{0:04X}")]
+    OwnClientId(u16),
 }
 
 #[cfg(test)]

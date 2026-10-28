@@ -1269,8 +1269,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the service is not found, unicast binding fails, or the UDP send
-    /// fails. Returns [`Error::UnsupportedEndpoint`] if the key's endpoint is not an IPv4/UDP
-    /// socket, and [`Error::Shutdown`] if the client's run-loop future has exited.
+    /// fails. Returns [`Error::OwnClientId`] if the request id carries this client's own client
+    /// id, which its [`request`](Self::request)s use, [`Error::UnsupportedEndpoint`] if the
+    /// key's endpoint is not an IPv4/UDP socket, and [`Error::Shutdown`] if the client's
+    /// run-loop future has exited.
     pub async fn relay_to_service(
         &self,
         key: ServiceEndpointKey,

@@ -1362,6 +1362,46 @@ async fn test_a_relayed_request_keeps_its_ids_and_its_answer_arrives_as_an_updat
     server_handle.abort();
 }
 
+/// The client's own requests carry its client id, so a relay carrying it is refused: a reply
+/// to it could not be told from a reply to one of them.
+#[tokio::test]
+async fn test_a_relay_with_the_clients_own_client_id_is_refused() {
+    let service_id = next_service_id();
+    let (client, _updates, run_fut) = TestClient::new(Ipv4Addr::LOCALHOST);
+    let _run_handle = tokio::spawn(run_fut);
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(SERVER_IP, 30_599));
+    client
+        .add_endpoint(ServiceEndpointKey::udp(service_id, server_addr), 1, 0)
+        .await
+        .unwrap();
+    let message_id = MessageId::new_from_service_and_method(service_id, 0x0007);
+    let request = Message::new(
+        Header::new(
+            message_id,
+            0x1234_0001,
+            1,
+            1,
+            MessageTypeField::new(MessageType::Request, false),
+            ReturnCode::Ok,
+            4,
+        ),
+        RawPayload::from_payload_bytes(message_id, b"ping").unwrap(),
+    );
+
+    let refused = client
+        .relay_to_service(ServiceEndpointKey::udp(service_id, server_addr), request)
+        .await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(simple_someip::client::Error::OwnClientId(0x1234))
+        ),
+        "expected OwnClientId, got {refused:?}"
+    );
+    client.shut_down();
+}
+
 /// A server and a client on one interface share the SD port: the server, on 127.0.0.1, serves a
 /// plain client on 127.0.0.3; the client, also on 127.0.0.1, subscribes to a plain server on
 /// 127.0.0.2. Each of the two pairs is served through the shared sockets on 127.0.0.1:30490.
