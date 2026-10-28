@@ -27,6 +27,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::Poll;
 use std::vec::Vec;
 
 use tokio::sync::mpsc;
@@ -80,8 +81,52 @@ struct Inner {
     interface: Ipv4Addr,
     endpoint: SdEndpoint,
     taps: Mutex<Vec<(Origin, mpsc::Sender<Arc<Datagram>>)>>,
-    /// The endpoint sockets by port.
-    endpoints: tokio::sync::Mutex<HashMap<u16, Arc<Endpoint>>>,
+    /// The endpoint sockets by port, while a participant holds them.
+    endpoints: tokio::sync::Mutex<HashMap<u16, Weak<Endpoint>>>,
+    workers: Workers,
+}
+
+/// The receive workers of the sockets' owner, cancelled when it drops. A worker holds its owner
+/// only while it polls the socket, so the sockets close when their last participant drops them.
+#[derive(Default)]
+struct Workers(Mutex<Vec<tokio::task::AbortHandle>>);
+
+impl Workers {
+    fn add(&self, worker: tokio::task::AbortHandle) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(worker);
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        let workers = self
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for worker in workers.iter() {
+            worker.abort();
+        }
+    }
+}
+
+/// The next datagram on `socket` of `owner`, holding `owner` only while polling; `None` once
+/// it is gone.
+async fn receive<O>(
+    owner: &Weak<O>,
+    socket: fn(&O) -> &TokioSocket,
+    buf: &mut [u8],
+) -> Option<(Arc<O>, Result<ReceivedDatagram, TransportError>)> {
+    std::future::poll_fn(|cx| {
+        let Some(owner) = owner.upgrade() else {
+            return Poll::Ready(None);
+        };
+        let polled = Pin::new(&mut socket(&owner).recv_from(&mut *buf)).poll(cx);
+        polled.map(|received| Some((owner, received)))
+    })
+    .await
 }
 
 /// Which messages a tap on an endpoint socket receives.
@@ -105,16 +150,18 @@ struct Addressed {
 struct Endpoint {
     socket: TokioSocket,
     taps: Mutex<Vec<(Serves, mpsc::Sender<Arc<Datagram>>)>>,
+    workers: Workers,
 }
 
 impl Endpoint {
     /// A tap for `serves`. A second server of one service on the socket is refused: the
-    /// service's instances listen on different ports.
+    /// service's instances listen on different ports. A dropped server's tap is no server.
     fn tap(self: &Arc<Self>, serves: Serves) -> Result<EndpointTap, TransportError> {
         let mut taps = self
             .taps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        taps.retain(|(_, tap)| !tap.is_closed());
         if serves != Serves::Rest && taps.iter().any(|(taken, _)| *taken == serves) {
             return Err(TransportError::AddressInUse);
         }
@@ -168,9 +215,12 @@ impl SharedSd {
             endpoint,
             taps: Mutex::new(Vec::new()),
             endpoints: tokio::sync::Mutex::new(HashMap::new()),
+            workers: Workers::default(),
         });
-        tokio::spawn(fan_out(Arc::downgrade(&inner), Origin::Unicast));
-        tokio::spawn(fan_out(Arc::downgrade(&inner), Origin::Multicast));
+        for origin in [Origin::Unicast, Origin::Multicast] {
+            let worker = tokio::spawn(fan_out(Arc::downgrade(&inner), origin));
+            inner.workers.add(worker.abort_handle());
+        }
         Ok(Self { inner })
     }
 
@@ -214,9 +264,10 @@ impl SharedSd {
     /// The endpoint socket on `port`, bound on first use.
     async fn endpoint_socket(&self, port: u16) -> Result<Arc<Endpoint>, TransportError> {
         let mut endpoints = self.inner.endpoints.lock().await;
-        if let Some(endpoint) = endpoints.get(&port) {
-            return Ok(Arc::clone(endpoint));
+        if let Some(endpoint) = endpoints.get(&port).and_then(Weak::upgrade) {
+            return Ok(endpoint);
         }
+        endpoints.retain(|_, endpoint| endpoint.strong_count() > 0);
         let socket = TokioTransport
             .bind(
                 SocketAddrV4::new(self.inner.interface, port),
@@ -226,9 +277,11 @@ impl SharedSd {
         let endpoint = Arc::new(Endpoint {
             socket,
             taps: Mutex::new(Vec::new()),
+            workers: Workers::default(),
         });
-        tokio::spawn(fan_out_endpoint(Arc::downgrade(&endpoint)));
-        endpoints.insert(port, Arc::clone(&endpoint));
+        let worker = tokio::spawn(fan_out_endpoint(Arc::downgrade(&endpoint)));
+        endpoint.workers.add(worker.abort_handle());
+        endpoints.insert(port, Arc::downgrade(&endpoint));
         Ok(endpoint)
     }
 
@@ -325,15 +378,15 @@ pub type SharedPublisher<R, Sub> = Arc<EventPublisher<R, Sub, Arc<SharedSocket>,
 /// shared sockets are gone.
 async fn fan_out(inner: Weak<Inner>, from: Origin) {
     let mut buf = std::vec![0u8; MAX_DATAGRAM];
+    let socket: fn(&Inner) -> &TokioSocket = match from {
+        Origin::Unicast => |inner| &inner.unicast,
+        Origin::Multicast | Origin::Both => |inner| &inner.multicast,
+    };
     loop {
-        let Some(inner) = inner.upgrade() else {
+        let Some((inner, received)) = receive(&inner, socket, &mut buf).await else {
             return;
         };
-        let socket = match from {
-            Origin::Unicast => &inner.unicast,
-            Origin::Multicast | Origin::Both => &inner.multicast,
-        };
-        let received = match socket.recv_from(&mut buf).await {
+        let received = match received {
             Ok(received) => received,
             Err(e) => {
                 crate::log::warn!("shared SD socket ({:?}) failed: {:?}", from, e);
@@ -372,10 +425,12 @@ async fn fan_out(inner: Weak<Inner>, from: Origin) {
 async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
     let mut buf = std::vec![0u8; MAX_DATAGRAM];
     loop {
-        let Some(endpoint) = endpoint.upgrade() else {
+        let Some((endpoint, received)) =
+            receive(&endpoint, |endpoint| &endpoint.socket, &mut buf).await
+        else {
             return;
         };
-        let received = match endpoint.socket.recv_from(&mut buf).await {
+        let received = match received {
             Ok(received) => received,
             Err(e) => {
                 crate::log::warn!("shared endpoint socket failed: {:?}", e);
@@ -644,7 +699,7 @@ impl TransportFactory for SharedTransport {
             }
             if addr.port() != 0 {
                 let endpoints = self.shared.inner.endpoints.lock().await;
-                if let Some(endpoint) = endpoints.get(&addr.port()) {
+                if let Some(endpoint) = endpoints.get(&addr.port()).and_then(Weak::upgrade) {
                     return endpoint.tap(Serves::Rest).map(SharedSocket::Endpoint);
                 }
             }
@@ -802,6 +857,51 @@ mod tests {
             one.local_addr().unwrap(),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_servers_service_can_be_served_again_on_the_port() {
+        let endpoint = SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 248), PORT + 4).unwrap();
+        let shared = SharedSd::bind(Ipv4Addr::LOCALHOST, endpoint, true)
+            .await
+            .unwrap();
+        let port = PORT + 5;
+        let socket = shared.endpoint_socket(port).await.unwrap();
+        let _client = socket.tap(Serves::Rest).unwrap();
+
+        drop(socket.tap(Serves::Service(1)).unwrap());
+
+        assert!(socket.tap(Serves::Service(1)).is_ok());
+    }
+
+    /// Plain sockets without address reuse bind only once nothing else holds the address.
+    fn bind_alone(port: u16) -> std::io::Result<std::net::UdpSocket> {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+    }
+
+    #[tokio::test]
+    async fn the_sockets_close_with_their_last_participant() {
+        let endpoint = SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 245), PORT + 6).unwrap();
+        let shared = SharedSd::bind(Ipv4Addr::LOCALHOST, endpoint, true)
+            .await
+            .unwrap();
+        let port = PORT + 7;
+        let server = shared
+            .endpoint_socket(port)
+            .await
+            .unwrap()
+            .tap(Serves::Service(1))
+            .unwrap();
+        let tap = shared.tap(Origin::Both);
+        tokio::task::yield_now().await;
+        drop(shared);
+        assert!(bind_alone(PORT + 6).is_err(), "the tap holds the SD socket");
+        assert!(bind_alone(port).is_err(), "the server holds the endpoint");
+
+        drop(server);
+        assert!(bind_alone(port).is_ok(), "the endpoint socket is closed");
+        drop(tap);
+        assert!(bind_alone(PORT + 6).is_ok(), "the SD sockets are closed");
     }
 
     #[test]
