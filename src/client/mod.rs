@@ -909,8 +909,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if rebinding the discovery socket fails, and [`Error::Shutdown`] if the
-    /// client's run-loop future has exited.
+    /// Returns an error if rebinding the discovery socket fails; the client then stays on the
+    /// endpoint it had. Returns [`Error::Shutdown`] if the client's run-loop future has exited.
     pub async fn set_sd_endpoint(&self, endpoint: protocol::sd::SdEndpoint) -> Result<(), Error> {
         let (response, message) = ControlMessage::set_sd_endpoint(endpoint);
         self.control_sender

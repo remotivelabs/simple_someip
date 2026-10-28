@@ -534,6 +534,30 @@ where
         }
     }
 
+    /// Exchange SD on `endpoint`. A bound discovery socket is rebound there; when that fails,
+    /// it is rebound on the endpoint it had, so discovery goes on where it was.
+    async fn set_sd_endpoint(
+        &mut self,
+        endpoint: crate::protocol::sd::SdEndpoint,
+    ) -> Result<(), Error> {
+        let previous = self.sd_endpoint;
+        self.sd_endpoint = endpoint;
+        if self.discovery_socket.is_none() {
+            return Ok(());
+        }
+        info!("Discovery socket bound; rebinding on SD endpoint {endpoint:?}");
+        self.unbind_discovery().await;
+        let Err(e) = self.bind_discovery().await else {
+            return Ok(());
+        };
+        warn!("Rebinding discovery on {endpoint:?} failed ({e:?}); staying on {previous:?}");
+        self.sd_endpoint = previous;
+        if let Err(restore) = self.bind_discovery().await {
+            error!("Rebinding discovery on {previous:?} failed too: {restore:?}");
+        }
+        Err(e)
+    }
+
     // Dropping the receiver kills the loop
     async fn unbind_discovery(&mut self) {
         debug!("Unbinding Discovery socket.");
@@ -920,17 +944,7 @@ where
                     }
                 }
                 ControlMessage::SetSdEndpoint(endpoint, response) => {
-                    let rebind = self.discovery_socket.is_some();
-                    if rebind {
-                        info!("Discovery socket bound; rebinding on SD endpoint {endpoint:?}");
-                        self.unbind_discovery().await;
-                    }
-                    self.sd_endpoint = endpoint;
-                    let result = if rebind {
-                        self.bind_discovery().await
-                    } else {
-                        Ok(())
-                    };
+                    let result = self.set_sd_endpoint(endpoint).await;
                     if response.send(result).is_err() {
                         debug!("SetSdEndpoint: caller dropped the response receiver");
                     }
@@ -1056,6 +1070,11 @@ where
                     message,
                     send_complete,
                 } => {
+                    let client_id = (message.header().request_id() >> 16) as u16;
+                    if client_id == self.client_id {
+                        let _ = send_complete.send(Err(Error::OwnClientId(client_id)));
+                        return;
+                    }
                     let (target, source_port) = match self.outbound(key).await {
                         Ok(found) => found,
                         Err(e) => {
@@ -1072,11 +1091,6 @@ where
                     send_complete,
                     response,
                 } => {
-                    let client_id = (message.header().request_id() >> 16) as u16;
-                    if client_id == self.client_id {
-                        let _ = send_complete.send(Err(Error::OwnClientId(client_id)));
-                        return;
-                    }
                     let (target, source_port) = match self.outbound(key).await {
                         Ok(found) => found,
                         Err(e) => {
@@ -1664,6 +1678,31 @@ mod tests {
             timer: TokioTimer,
             phantom: core::marker::PhantomData,
         }
+    }
+
+    /// A rebind on an endpoint whose port is taken fails, and discovery stays bound on the
+    /// endpoint it had.
+    #[tokio::test]
+    async fn a_failed_sd_endpoint_rebind_stays_on_the_old_endpoint() {
+        let mut inner = make_inner_for_test();
+        let old =
+            crate::protocol::sd::SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 247), 30_487).unwrap();
+        inner.sd_endpoint = old;
+        inner
+            .bind_discovery()
+            .await
+            .expect("bound on the old endpoint");
+        let taken = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let new = crate::protocol::sd::SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 246), taken_port)
+            .unwrap();
+
+        let result = inner.set_sd_endpoint(new).await;
+
+        assert!(result.is_err(), "the taken port cannot be bound");
+        assert_eq!(inner.sd_endpoint, old);
+        assert!(inner.discovery_socket.is_some(), "discovery is bound again");
+        inner.unbind_discovery().await;
     }
 
     #[tokio::test]
