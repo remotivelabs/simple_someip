@@ -1102,6 +1102,39 @@ async fn next_datagram(peer: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
     (buf[..len].to_vec(), from)
 }
 
+/// SOME/IP messages may share one UDP datagram, so each request in it is observed.
+#[tokio::test]
+async fn test_every_request_of_one_datagram_is_observed() {
+    let service_id = next_service_id();
+    let (server, port, mut requests) = create_answering_server(service_id).await;
+    let server_handle = tokio::spawn(async move { server.run().await });
+    let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let mut datagram = request_bytes(
+        service_id,
+        0x0007,
+        MessageType::Request,
+        0x00AB_0001,
+        b"one",
+    );
+    datagram.extend(request_bytes(
+        service_id,
+        0x0008,
+        MessageType::RequestNoReturn,
+        0x00AB_0002,
+        b"two",
+    ));
+
+    peer.send_to(&datagram, SocketAddrV4::new(SERVER_IP, port))
+        .await
+        .unwrap();
+
+    assert_eq!(next_request(&mut requests).await.payload(), b"one");
+    assert_eq!(next_request(&mut requests).await.payload(), b"two");
+    server_handle.abort();
+}
+
 #[tokio::test]
 async fn test_a_request_is_observed_and_its_response_goes_back_to_the_caller() {
     let service_id = next_service_id();
