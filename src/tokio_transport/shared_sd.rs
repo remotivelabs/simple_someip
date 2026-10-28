@@ -47,6 +47,24 @@ use crate::transport::{
 const TAP_DEPTH: usize = 64;
 /// The largest UDP datagram.
 const MAX_DATAGRAM: usize = 65_535;
+/// How many receive errors in a row, none of them transient, end a worker.
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 16;
+
+/// A worker's run of receive errors. A transient one, such as an ICMP port unreachable, is
+/// passed over; a run of [`MAX_CONSECUTIVE_RECV_ERRORS`] others ends the worker.
+#[derive(Default)]
+struct RecvErrors(u32);
+
+impl RecvErrors {
+    /// Whether the worker gives up after `error`.
+    fn give_up(&mut self, error: TransportError) -> bool {
+        if matches!(error, TransportError::Io(kind) if kind.is_transient_recv()) {
+            return false;
+        }
+        self.0 += 1;
+        self.0 >= MAX_CONSECUTIVE_RECV_ERRORS
+    }
+}
 
 /// Which of the two sockets a tap receives from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,15 +400,28 @@ async fn fan_out(inner: Weak<Inner>, from: Origin) {
         Origin::Unicast => |inner| &inner.unicast,
         Origin::Multicast | Origin::Both => |inner| &inner.multicast,
     };
+    let mut errors = RecvErrors::default();
     loop {
         let Some((inner, received)) = receive(&inner, socket, &mut buf).await else {
             return;
         };
         let received = match received {
-            Ok(received) => received,
+            Ok(received) => {
+                errors = RecvErrors::default();
+                received
+            }
             Err(e) => {
                 crate::log::warn!("shared SD socket ({:?}) failed: {:?}", from, e);
-                return;
+                if errors.give_up(e) {
+                    // Closing the taps that admit this socket tells their participants.
+                    inner
+                        .taps
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain(|(origin, _)| !origin.admits(from));
+                    return;
+                }
+                continue;
             }
         };
         let datagram = Arc::new(Datagram {
@@ -424,6 +455,7 @@ async fn fan_out(inner: Weak<Inner>, from: Origin) {
 /// once the socket is gone.
 async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
     let mut buf = std::vec![0u8; MAX_DATAGRAM];
+    let mut errors = RecvErrors::default();
     loop {
         let Some((endpoint, received)) =
             receive(&endpoint, |endpoint| &endpoint.socket, &mut buf).await
@@ -431,10 +463,22 @@ async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
             return;
         };
         let received = match received {
-            Ok(received) => received,
+            Ok(received) => {
+                errors = RecvErrors::default();
+                received
+            }
             Err(e) => {
                 crate::log::warn!("shared endpoint socket failed: {:?}", e);
-                return;
+                if errors.give_up(e) {
+                    // Closing the taps tells their participants.
+                    endpoint
+                        .taps
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    return;
+                }
+                continue;
             }
         };
         let mut taps = endpoint
@@ -902,6 +946,18 @@ mod tests {
         assert!(bind_alone(port).is_ok(), "the endpoint socket is closed");
         drop(tap);
         assert!(bind_alone(PORT + 6).is_ok(), "the SD sockets are closed");
+    }
+
+    #[test]
+    fn a_worker_gives_up_after_a_run_of_errors_that_are_not_transient() {
+        let mut errors = RecvErrors::default();
+        for _ in 0..100 {
+            assert!(!errors.give_up(TransportError::Io(IoErrorKind::ConnectionRefused)));
+        }
+        for _ in 1..MAX_CONSECUTIVE_RECV_ERRORS {
+            assert!(!errors.give_up(TransportError::Io(IoErrorKind::Other)));
+        }
+        assert!(errors.give_up(TransportError::Io(IoErrorKind::Other)));
     }
 
     #[test]
