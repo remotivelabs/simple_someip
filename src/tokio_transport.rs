@@ -55,8 +55,6 @@ use crate::transport::{
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokioTransport;
 
-/// The SD sockets and the endpoint sockets shared by every participant in a process (needs
-/// `server`).
 #[cfg(all(feature = "server", feature = "client"))]
 pub mod shared_sd;
 
