@@ -386,6 +386,7 @@ mod client_future_probe {
             (Result<(), ClientError>, 16),
             (Result<ProbePayload, ClientError>, 8),
             (Result<RebootFlag, ClientError>, 8),
+            (Result<simple_someip::protocol::sd::SdEndpoint, ClientError>, 8),
         ],
         bounded: [
             ((ControlMessage<ProbePayload, ProbeChannels>, 4), 4),
