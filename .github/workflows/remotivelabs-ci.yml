@@ -1,0 +1,62 @@
+# Tests and lints for this fork. The upstream workflows (ci.yml, main.yml,
+# label-issues.yml) are disabled here: they publish releases and upload
+# coverage with secrets this fork does not have.
+name: RemotiveLabs CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ALLOC_FEATURES: std,tracing,client,client-tokio,server,server-tokio,bare_metal,embassy_channels
+  HOST_FEATURES: std,tracing,client,client-tokio,server,server-tokio
+
+jobs:
+  lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --no-default-features --features $ALLOC_FEATURES -- -D warnings -D clippy::pedantic
+      - run: cargo clippy --no-default-features -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features server,bare_metal -- -D warnings -D clippy::pedantic
+      - run: cargo clippy -p simple-someip --no-default-features --features client,server,bare_metal -- -D warnings -D clippy::pedantic
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # nextest runs the tests that share the SD port or static pools one at a
+      # time (.config/nextest.toml); `cargo test` runs them in parallel.
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
+        with:
+          tool: cargo-nextest
+      # The client/server tests join SD multicast on loopback.
+      - run: sudo ip link set lo multicast on
+      - run: cargo test --no-default-features
+      - run: cargo nextest run --no-default-features --features $ALLOC_FEATURES -E 'binary(bare_metal_e2e) | binary(bare_metal_client_local) | binary(static_channels_alloc_witness)'
+      - run: cargo nextest run --no-default-features --features $HOST_FEATURES
+      - run: cargo test --doc --no-default-features --features $HOST_FEATURES
+      - run: cargo test --features client,bare_metal --test no_alloc_witness
+      - run: cargo test -p simple-someip-embassy-net
