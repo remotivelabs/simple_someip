@@ -34,6 +34,7 @@ use std::vec::Vec;
 use simple_someip::e2e::E2ERegistry;
 use simple_someip::server::NonSdRequestCallback;
 use simple_someip::server::ServerConfig;
+use simple_someip::server::{Request, RequestObserver, RequestObserverHandle, ResponseTarget};
 use simple_someip::server::{SubscribeError, Subscriber, SubscriptionHandle};
 use simple_someip::transport::{
     ReceivedDatagram, SocketOptions, Timer, TransportError, TransportFactory, TransportSocket,
@@ -304,6 +305,7 @@ async fn server_constructible_without_server_tokio_feature() {
             e2e_registry: e2e_handle,
             subscriptions: subs,
             non_sd_observer: None,
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -352,6 +354,7 @@ async fn passive_server_constructible_without_server_tokio_feature() {
             e2e_registry: e2e_handle,
             subscriptions: subs,
             non_sd_observer: None,
+            request_observer: None,
         };
 
     let (_server, _handles, _run): (
@@ -534,6 +537,7 @@ async fn non_sd_observer_some_receives_unicast_method_request() {
             e2e_registry: e2e_handle,
             subscriptions: subs,
             non_sd_observer: Some((record_some as NonSdRequestCallback, 0xC0FF_EE00)),
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -619,6 +623,7 @@ async fn non_sd_observer_ignores_sd_message_on_unicast_socket() {
             e2e_registry: e2e_handle,
             subscriptions: MockSubscriptions::default(),
             non_sd_observer: Some((record_sd_unicast as NonSdRequestCallback, 7)),
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -686,6 +691,7 @@ async fn non_sd_observer_ignores_non_sd_on_multicast_socket() {
             e2e_registry: e2e_handle,
             subscriptions: MockSubscriptions::default(),
             non_sd_observer: Some((record_multicast as NonSdRequestCallback, 9)),
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -753,6 +759,7 @@ async fn non_sd_observer_none_preserves_ignore_behavior() {
             e2e_registry: e2e_handle,
             subscriptions: MockSubscriptions::default(),
             non_sd_observer: None,
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -875,6 +882,7 @@ async fn non_sd_responder_frames_and_sends_response() {
             e2e_registry: e2e_handle,
             subscriptions: MockSubscriptions::default(),
             non_sd_observer: Some((respond_with_body as NonSdRequestCallback, 0)),
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -950,6 +958,7 @@ async fn non_sd_responder_oversized_length_is_rejected_not_panicked() {
             e2e_registry: e2e_handle,
             subscriptions: MockSubscriptions::default(),
             non_sd_observer: Some((respond_oversized as NonSdRequestCallback, 0)),
+            request_observer: None,
         };
 
     let (_server, _handles, run): (
@@ -1031,6 +1040,7 @@ async fn drive_co_offer_subscribe(local_port: u16, subscribe_major: u8) -> Vec<S
             e2e_registry: e2e_handle,
             subscriptions: subs,
             non_sd_observer: None,
+            request_observer: None,
         };
     let (_server, _handles, run): (
         Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
@@ -1103,4 +1113,243 @@ async fn co_offered_subscribe_with_wrong_major_version_is_rejected() {
         "co-offered subscribe with a mismatched major version must be rejected, \
          not silently accepted by skipping the version guard"
     );
+}
+
+// ── RequestObserver witness ───────────────────────────────────────────
+
+/// Records every request it is told about.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<(ResponseTarget, bool, Vec<u8>)>>);
+
+impl RequestObserver for Recorder {
+    fn on_request(&self, request: &Request<'_>) {
+        self.0.lock().unwrap().push((
+            request.target(),
+            request.expects_response(),
+            request.payload().to_vec(),
+        ));
+    }
+}
+
+#[tokio::test]
+async fn request_observer_is_told_about_requests_and_fire_and_forget_calls() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let observer: RequestObserverHandle = recorder.clone();
+
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30710);
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: None,
+            request_observer: Some(observer),
+        };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
+    let request = build_method_request_with_id(0x1234, 0x0001, 0x00AB_0005, &[0xAA]);
+    let mut fire_and_forget = build_method_request_with_id(0x1234, 0x0002, 0x00AB_0006, &[0xBB]);
+    fire_and_forget[14] = 0x01; // message_type = REQUEST_NO_RETURN
+    {
+        let mut inbound = unicast_pipe.inbound.lock().unwrap();
+        inbound.push_back((request, src));
+        inbound.push_back((fire_and_forget, src));
+    }
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| recorder.0.lock().unwrap().len() == 2).await;
+
+    let observed = recorder.0.lock().unwrap().clone();
+    let (target, expects_response, payload) = &observed[0];
+    assert_eq!(target.source(), src);
+    assert_eq!((target.service_id(), target.method_id()), (0x1234, 0x0001));
+    assert_eq!((target.client_id(), target.session_id()), (0x00AB, 0x0005));
+    assert!(*expects_response);
+    assert_eq!(payload, &[0xAA]);
+    let (target, expects_response, payload) = &observed[1];
+    assert_eq!(target.method_id(), 0x0002);
+    assert!(!*expects_response);
+    assert_eq!(payload, &[0xBB]);
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A request with the SOME/IP-TP flag is a segment, not a whole request.
+fn as_tp_segment(mut request: Vec<u8>) -> Vec<u8> {
+    request[14] |= 0x20;
+    request
+}
+
+#[tokio::test]
+async fn request_observer_is_told_only_about_whole_requests_to_offered_services() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let observer: RequestObserverHandle = recorder.clone();
+
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30712)
+        .with_accepted_offer(0x5678, 1, 2, 0x0001);
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: None,
+            request_observer: Some(observer),
+        };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
+    {
+        let mut inbound = unicast_pipe.inbound.lock().unwrap();
+        inbound.push_back((
+            build_method_request_with_id(0x9999, 0x0001, 0x00AB_0001, &[]),
+            src,
+        ));
+        inbound.push_back((
+            build_method_request_with_id(0x5678, 0x0001, 0x00AB_0002, &[]),
+            src,
+        ));
+        inbound.push_back((
+            as_tp_segment(build_method_request_with_id(
+                0x1234,
+                0x0002,
+                0x00AB_0003,
+                &[0, 0, 0, 0],
+            )),
+            src,
+        ));
+        inbound.push_back((
+            build_method_request_with_id(0x1234, 0x0001, 0x00AB_0004, &[]),
+            src,
+        ));
+    }
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| recorder.0.lock().unwrap().len() == 2).await;
+
+    let observed: Vec<(u16, u16)> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(target, _, _)| (target.service_id(), target.method_id()))
+        .collect();
+    assert_eq!(observed, [(0x5678, 0x0001), (0x1234, 0x0001)]);
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A request to a service the server does not offer is answered with `E_UNKNOWN_SERVICE`; a
+/// fire-and-forget one is not answered.
+#[tokio::test]
+async fn a_request_to_a_service_the_server_does_not_offer_is_answered_unknown_service() {
+    let unicast_pipe = Arc::new(MockPipe::default());
+    let factory = MockFactory {
+        unicast_pipe: Arc::clone(&unicast_pipe),
+        sd_pipe: Arc::new(MockPipe::default()),
+        next_port: Arc::new(Mutex::new(0)),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let observer: RequestObserverHandle = recorder.clone();
+
+    let config = ServerConfig::new(0x1234, 1)
+        .with_interface(Ipv4Addr::LOCALHOST)
+        .with_local_port(30713);
+    let deps: ServerDeps<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions> =
+        ServerDeps {
+            factory,
+            timer: MockTimer,
+            e2e_registry: Arc::new(Mutex::new(E2ERegistry::new())),
+            subscriptions: MockSubscriptions::default(),
+            non_sd_observer: None,
+            request_observer: Some(observer),
+        };
+    let (_server, _handles, run): (
+        Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
+        _,
+        _,
+    ) = Server::new_with_deps(deps, config, false)
+        .await
+        .expect("Server::new_with_deps must succeed");
+    let handle = tokio::spawn(run);
+
+    let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 100), 40000);
+    let mut fire_and_forget = build_method_request_with_id(0x9999, 0x0002, 0x00AB_0002, &[]);
+    fire_and_forget[14] = 0x01;
+    {
+        let mut inbound = unicast_pipe.inbound.lock().unwrap();
+        inbound.push_back((
+            build_method_request_with_id(0x9999, 0x0001, 0x00AB_0001, &[]),
+            src,
+        ));
+        inbound.push_back((fire_and_forget, src));
+        inbound.push_back((
+            build_method_request_with_id(0x1234, 0x0001, 0x00AB_0003, &[]),
+            src,
+        ));
+    }
+    if let Some(w) = unicast_pipe.inbound_waker.lock().unwrap().take() {
+        w.wake();
+    }
+
+    drive_until(|| recorder.0.lock().unwrap().len() == 1).await;
+
+    let sent: Vec<(Vec<u8>, SocketAddrV4)> = unicast_pipe.sent.lock().unwrap().drain(..).collect();
+    assert_eq!(sent.len(), 1, "one answer, to the request that expects one");
+    let (answer, to) = &sent[0];
+    assert_eq!(*to, src);
+    assert_eq!(answer.len(), 16, "a header and no payload");
+    assert_eq!(
+        &answer[..4],
+        &[0x99, 0x99, 0x00, 0x01],
+        "the request's service and method"
+    );
+    assert_eq!(
+        &answer[8..12],
+        &0x00AB_0001_u32.to_be_bytes(),
+        "its request id"
+    );
+    assert_eq!(answer[14], 0x80, "a RESPONSE");
+    assert_eq!(answer[15], 0x02, "E_UNKNOWN_SERVICE");
+
+    handle.abort();
+    let _ = handle.await;
 }

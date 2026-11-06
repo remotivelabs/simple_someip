@@ -11,7 +11,6 @@
 //! migration point for the announcement path.
 
 use crate::CapacityKind;
-use core::net::SocketAddrV4;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::protocol::sd::{
@@ -246,7 +245,7 @@ impl SdStateManager {
             .encode_to_slice(&mut buf[..16])
             .map_err(|_| Error::Capacity(CapacityKind::UdpBuffer))?;
 
-        let multicast_addr = SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT);
+        let multicast_addr = config.sd_endpoint.multicast();
 
         crate::log::trace!(
             "Sending OfferService: service=0x{:04X}, instance={}, port={}, size={} bytes",
@@ -556,10 +555,7 @@ mod tests {
         expected_reboot: RebootFlag,
     ) {
         // Goes to the SD multicast group on port 30490.
-        assert_eq!(
-            target,
-            SocketAddrV4::new(sd::MULTICAST_IP, sd::MULTICAST_PORT),
-        );
+        assert_eq!(target, config.sd_endpoint.multicast(),);
         let view = MessageView::parse(bytes).expect("parses as SOME/IP");
         // SD envelope. message_id = (0xFFFF, 0x8100), notification, ok.
         assert_eq!(view.header().message_id().service_id(), 0xFFFF);
@@ -612,6 +608,38 @@ mod tests {
         let (target, bytes) = &captured[0];
         // Initial counter 0x1233 → first emission carries 0x0000_1234,
         // and the manager has not wrapped, so reboot=RecentlyRebooted.
+        assert_captured_offer_matches(
+            bytes,
+            *target,
+            &config,
+            0x0000_1234,
+            RebootFlag::RecentlyRebooted,
+        );
+    }
+
+    /// An offer goes to the configured SD endpoint, not the standard one.
+    #[tokio::test]
+    async fn send_offer_service_through_mock_targets_the_configured_sd_endpoint() {
+        let endpoint = sd::SdEndpoint::new(Ipv4Addr::new(224, 0, 55, 55), 30491).unwrap();
+        let config = ServerConfig::new(TEST_SERVICE_ID, TEST_INSTANCE_ID)
+            .with_interface(Ipv4Addr::LOCALHOST)
+            .with_local_port(TEST_ADVERTISED_PORT)
+            .with_sd_endpoint(endpoint);
+        let sd_state = SdStateManager::with_initial(0x1233);
+        let sock = CapturingSocket::new();
+
+        sd_state
+            .send_offer_service(&mut [0u8; crate::UDP_BUFFER_SIZE], &config, &sock)
+            .await
+            .expect("send_offer_service should succeed against the mock");
+
+        let captured = sock.drain_sent();
+        assert_eq!(captured.len(), 1, "expected exactly one send_to call");
+        let (target, bytes) = &captured[0];
+        assert_eq!(
+            *target,
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 55, 55), 30491)
+        );
         assert_captured_offer_matches(
             bytes,
             *target,

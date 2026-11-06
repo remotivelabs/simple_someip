@@ -14,6 +14,8 @@ pub mod tp;
 
 pub use error::Error;
 pub use header::{Header, HeaderView};
+#[cfg(feature = "server")]
+pub(crate) use message::messages;
 pub use message::{Message, MessageView};
 pub use message_id::MessageId;
 pub use message_type::{MessageType, MessageTypeField};

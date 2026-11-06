@@ -56,6 +56,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 
     /// Bind a unicast socket on `port` (0 = ephemeral) and submit its
@@ -75,7 +76,11 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
+
+    /// The factory's SD endpoint, where the client starts exchanging SD.
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint>;
 }
 
 /// `BindDispatch` for the multi-threaded path: requires a
@@ -108,6 +113,10 @@ where
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint> {
+        self.factory.sd_endpoint()
+    }
+
     // `async move` body (rather than `async fn`) is required: the trait
     // method returns `impl Future`, and the block must capture `&self` to
     // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
@@ -119,6 +128,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -133,6 +143,7 @@ where
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
+                sd_endpoint,
                 buf,
             )
             .await
@@ -166,6 +177,7 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -177,6 +189,7 @@ where
                 &self.spawner,
                 interface,
                 e2e_registry,
+                sd_port,
                 buf,
             )
             .await
@@ -211,6 +224,10 @@ where
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint> {
+        self.factory.sd_endpoint()
+    }
+
     // `async move` body (rather than `async fn`) is required: the trait
     // method returns `impl Future`, and the block must capture `&self` to
     // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
@@ -222,6 +239,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -236,6 +254,7 @@ where
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
+                sd_endpoint,
                 buf,
             )
             .await
@@ -269,6 +288,7 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -280,6 +300,7 @@ where
                 &self.spawner,
                 interface,
                 e2e_registry,
+                sd_port,
                 buf,
             )
             .await

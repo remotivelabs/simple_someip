@@ -72,6 +72,7 @@ define_static_channels! {
         (Result<(), ClientError>, 16),
         (Result<RawPayload, ClientError>, 8),
         (Result<RebootFlag, ClientError>, 8),
+        (Result<simple_someip::protocol::sd::SdEndpoint, ClientError>, 8),
     ],
     bounded: [
         ((ControlMessage<RawPayload, E2ETestChannels>, 4), 8),
@@ -384,6 +385,7 @@ async fn client_receives_server_sd_announcement() {
         e2e_registry: server_e2e,
         subscriptions: server_subs,
         non_sd_observer: None,
+        request_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -483,6 +485,7 @@ async fn client_send_request_server_runloop_stable() {
         e2e_registry: server_e2e,
         subscriptions: server_subs,
         non_sd_observer: None,
+        request_observer: None,
     };
 
     let (_server, _handles, run): (
@@ -655,6 +658,7 @@ async fn future_size_witness_bare_metal_channels() {
         e2e_registry: server_e2e,
         subscriptions: MockSubscriptions::default(),
         non_sd_observer: None,
+        request_observer: None,
     };
     let (_server, _handles, server_run): (
         Server<MockFactory, MockTimer, Arc<Mutex<E2ERegistry>>, MockSubscriptions>,
