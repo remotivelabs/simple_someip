@@ -12,7 +12,9 @@
 //! [`Server::run`](super::Server::run) /
 //! [`Server::run_with_buffers`](super::Server::run_with_buffers).
 
+use super::request::{Reply, Request, RequestObserver, ResponseTarget};
 use crate::CapacityKind;
+use crate::protocol::MessageType;
 use core::net::SocketAddrV4;
 
 use futures_util::{FutureExt, future::Either, pin_mut, select_biased};
@@ -275,6 +277,16 @@ where
                     entry_view.major_version(),
                     entry_view.event_group_id(),
                 );
+                if !config.offers(entry_view.service_id(), entry_view.instance_id())
+                    && !config.nack_other_services
+                {
+                    crate::log::trace!(
+                        "Subscribe for service 0x{:04X} instance {} is left to its server",
+                        entry_view.service_id(),
+                        entry_view.instance_id()
+                    );
+                    continue;
+                }
 
                 if !co_offered && entry_view.service_id() != config.service_id {
                     crate::log::warn!(
@@ -515,30 +527,19 @@ pub(super) async fn announce_loop<T, Tm>(
 /// id and protocol/interface versions — and send it back to `source`.
 /// `send_buf` must be distinct from the buffer `view` borrows: the handler
 /// writes its response payload after the header slot, so they don't alias.
-async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
+async fn dispatch_non_sd_request<T: TransportSocket>(
     unicast_socket: &T,
     observer: (super::NonSdRequestCallback, usize),
-    e2e: &R,
     view: &crate::protocol::MessageView<'_>,
     source: core::net::SocketAddrV4,
+    status: crate::e2e::E2ECheckStatus,
+    body: &[u8],
     send_buf: &mut [u8],
 ) {
     let (cb, ctx) = observer;
     let hdr = view.header();
     let id = hdr.message_id();
     let (service_id, method_id) = (id.service_id(), id.method_id());
-    // Run the same E2E check the notification path uses: a request whose
-    // (service, method) has a registered profile is validated and its E2E
-    // header stripped; one with no profile passes through unchecked (status
-    // 0).
-    let parsed = crate::sd_codec::ParsedDatagram {
-        service_id,
-        method_id,
-        upper_header: hdr.upper_header_bytes(),
-        payload: view.payload_bytes(),
-    };
-    let (status, body) =
-        crate::sd_codec::check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed);
     let resp_len = cb(
         ctx,
         source,
@@ -584,11 +585,128 @@ async fn dispatch_non_sd_request<T: TransportSocket, R: E2ERegistryHandle>(
     }
 }
 
+/// The E2E check every non-SD unicast datagram gets, once: a message whose (service,
+/// method) has a registered profile is validated and its E2E header stripped; one with no
+/// profile passes through unchecked.
+fn check_request_e2e<'a, R: E2ERegistryHandle>(
+    e2e: &R,
+    view: &crate::protocol::MessageView<'a>,
+    source: core::net::SocketAddrV4,
+) -> (crate::e2e::E2ECheckStatus, &'a [u8]) {
+    let hdr = view.header();
+    let id = hdr.message_id();
+    let parsed = crate::sd_codec::ParsedDatagram {
+        service_id: id.service_id(),
+        method_id: id.method_id(),
+        upper_header: hdr.upper_header_bytes(),
+        payload: view.payload_bytes(),
+    };
+    crate::sd_codec::check_parsed_e2e(e2e, core::net::IpAddr::V4(*source.ip()), &parsed)
+}
+
+/// Why a non-SD unicast message is not handed to the request observer.
+enum Unobserved {
+    /// A response or notification sent to the service port.
+    NoRequest,
+    /// A SOME/IP-TP segment: not a whole request, and nothing reassembles one yet.
+    Segment,
+    /// A request to a service the server does not offer.
+    NotOffered,
+}
+
+/// Tell `observer` about the request in `view` from `source`, or say why not: a response or
+/// notification sent to the service port is no request, a SOME/IP-TP segment is not a whole
+/// one, and a request to a service the server does not offer is left alone. A request names
+/// no instance, so the service id alone decides.
+fn observe_request<O: RequestObserver + ?Sized>(
+    config: &ServerConfig,
+    observer: &O,
+    view: &crate::protocol::MessageView<'_>,
+    source: core::net::SocketAddrV4,
+    status: crate::e2e::E2ECheckStatus,
+    body: &[u8],
+) -> Result<(), Unobserved> {
+    let hdr = view.header();
+    let message_type = hdr.message_type().message_type();
+    if !matches!(
+        message_type,
+        MessageType::Request | MessageType::RequestNoReturn
+    ) {
+        crate::log::trace!(
+            "Non-SD unicast {:?} is no request; not observed",
+            message_type
+        );
+        return Err(Unobserved::NoRequest);
+    }
+    let service_id = hdr.message_id().service_id();
+    if hdr.message_type().is_tp() {
+        crate::log::trace!(
+            "A SOME/IP-TP segment of a request to service 0x{:04X}; not observed, as nothing reassembles the request",
+            service_id
+        );
+        return Err(Unobserved::Segment);
+    }
+    if !config.offers_service(service_id) {
+        crate::log::trace!(
+            "Request to service 0x{:04X}, which this server does not offer; not observed",
+            service_id
+        );
+        return Err(Unobserved::NotOffered);
+    }
+    observer.on_request(&Request::new(
+        ResponseTarget::new(source, &hdr),
+        message_type,
+        body,
+        status,
+    ));
+    Ok(())
+}
+
+/// Answers a request to a service the server does not offer with `E_UNKNOWN_SERVICE`, the
+/// return code for a service id the receiver does not know ([`ReturnCode::UnknownService`]);
+/// a fire-and-forget request gets no answer (`feat_req_someip_345`).
+async fn answer_unknown_service<T: TransportSocket>(
+    unicast_socket: &T,
+    view: &crate::protocol::MessageView<'_>,
+    source: core::net::SocketAddrV4,
+    send_buf: &mut [u8],
+) {
+    use crate::protocol::{Header, MessageId, MessageTypeField, ReturnCode};
+    use automotive_wire_codec::Encode;
+
+    let hdr = view.header();
+    let target = ResponseTarget::new(source, &hdr);
+    if !target.expects_response() {
+        return;
+    }
+    let reply = Reply::response(ReturnCode::UnknownService);
+    let header = Header::new(
+        MessageId::new_from_service_and_method(target.service_id(), target.method_id()),
+        target.request_id(),
+        target.protocol_version(),
+        target.interface_version(),
+        MessageTypeField::new(reply.message_type(), false),
+        reply.return_code(),
+        0,
+    );
+    let Ok(len) = header.encode_to_slice(send_buf) else {
+        return;
+    };
+    if let Err(e) = unicast_socket.send_to(&send_buf[..len], source).await {
+        crate::log::warn!("E_UNKNOWN_SERVICE to {} not sent: {:?}", source, e);
+    }
+}
+
+/// Whether what is left of a datagram behind its messages is too short to be one.
+fn is_padding(rest: &[u8]) -> bool {
+    rest.len() < crate::sd_codec::SOMEIP_HEADER_LEN
+}
+
 /// Receive loop body — drives `recv_from` on both the unicast and SD
 /// sockets, dispatches SD messages to [`handle_sd_message`] and non-SD
 /// unicast requests to [`dispatch_non_sd_request`].
-#[allow(clippy::too_many_arguments)]
-async fn recv_loop<T, Sub, R>(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn recv_loop<T, Sub, R, O>(
     config: &ServerConfig,
     unicast_socket: &T,
     sd_socket: &T,
@@ -599,12 +717,15 @@ async fn recv_loop<T, Sub, R>(
     sd_buf: &mut [u8],
     send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    request_observer: Option<&O>,
 ) -> Result<(), Error>
 where
     T: TransportSocket,
     Sub: SubscriptionHandle,
     R: E2ERegistryHandle,
+    O: RequestObserver + ?Sized,
 {
+    use crate::Decode;
     use crate::protocol::MessageView;
 
     // Iteration counter used to flip `select_biased!` arm priority
@@ -666,61 +787,87 @@ where
         crate::log::trace!("Received {} bytes from {} on {} socket", len, addr, source);
         crate::log::trace!("Raw data: {:02X?}", &data[..len.min(64_usize)]);
 
-        match MessageView::parse(data) {
-            Ok(view) => {
-                crate::log::trace!(
-                    "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
-                    view.header().message_id().service_id(),
-                    view.header().message_id().method_id(),
-                    view.header().message_type().message_type()
-                );
+        // A datagram may carry several messages, one behind the other. Fewer bytes than a
+        // header behind the last of them are padding.
+        let mut rest = data;
+        while !rest.is_empty() {
+            let view = match MessageView::decode(rest) {
+                Ok((view, behind)) => {
+                    rest = behind;
+                    view
+                }
+                Err(_) if rest.len() < data.len() && is_padding(rest) => {
+                    crate::log::trace!("{} bytes of padding from {}", rest.len(), addr);
+                    break;
+                }
+                Err(e) => {
+                    crate::log::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
+                    crate::log::trace!("Data: {:02X?}", &rest[..rest.len().min(32)]);
+                    break;
+                }
+            };
+            crate::log::trace!(
+                "SOME/IP Header: service=0x{:04X}, method=0x{:04X}, type={:?}",
+                view.header().message_id().service_id(),
+                view.header().message_id().method_id(),
+                view.header().message_type().message_type()
+            );
 
-                if view.is_sd() {
-                    crate::log::trace!("This is an SD message");
-                    match view.sd_header() {
-                        Ok(sd_view) => {
-                            crate::log::trace!("SD message has {} entries", sd_view.entry_count());
-                            handle_sd_message(
-                                config,
-                                sd_socket,
-                                sd_state,
-                                subscriptions,
-                                &sd_view,
-                                addr,
-                                send_buf,
-                            )
-                            .await?;
-                        }
-                        Err(e) => {
-                            crate::log::warn!("Failed to parse SD message: {:?}", e);
-                        }
+            if view.is_sd() {
+                crate::log::trace!("This is an SD message");
+                match view.sd_header() {
+                    Ok(sd_view) => {
+                        crate::log::trace!("SD message has {} entries", sd_view.entry_count());
+                        handle_sd_message(
+                            config,
+                            sd_socket,
+                            sd_state,
+                            subscriptions,
+                            &sd_view,
+                            addr,
+                            send_buf,
+                        )
+                        .await?;
                     }
-                } else if from_unicast {
-                    // Non-SD unicast = a method request to an offered service.
-                    if let Some(observer) = non_sd_observer {
-                        if let core::net::SocketAddr::V4(src_v4) = addr {
+                    Err(e) => {
+                        crate::log::warn!("Failed to parse SD message: {:?}", e);
+                    }
+                }
+            } else if from_unicast {
+                // Non-SD unicast = a method request to an offered service.
+                if let core::net::SocketAddr::V4(src_v4) = addr {
+                    if non_sd_observer.is_none() && request_observer.is_none() {
+                        crate::log::trace!(
+                            "Non-SD unicast SOME/IP message, no observer registered — ignoring"
+                        );
+                    } else {
+                        let (status, body) = check_request_e2e(e2e, &view, src_v4);
+                        if let Some(observer) = request_observer {
+                            let observed =
+                                observe_request(config, observer, &view, src_v4, status, body);
+                            if matches!(observed, Err(Unobserved::NotOffered))
+                                && non_sd_observer.is_none()
+                            {
+                                answer_unknown_service(unicast_socket, &view, src_v4, send_buf)
+                                    .await;
+                            }
+                        }
+                        if let Some(callback) = non_sd_observer {
                             dispatch_non_sd_request(
                                 unicast_socket,
-                                observer,
-                                e2e,
+                                callback,
                                 &view,
                                 src_v4,
+                                status,
+                                body,
                                 send_buf,
                             )
                             .await;
                         }
-                    } else {
-                        crate::log::trace!(
-                            "Non-SD unicast SOME/IP message, no observer registered — ignoring"
-                        );
                     }
-                } else {
-                    crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
                 }
-            }
-            Err(e) => {
-                crate::log::warn!("Failed to parse SOME/IP header from {}: {:?}", addr, e);
-                crate::log::trace!("Data: {:02X?}", &data[..len.min(32)]);
+            } else {
+                crate::log::trace!("Non-SD multicast SOME/IP message, ignoring");
             }
         }
     }
@@ -740,7 +887,7 @@ where
 /// where a co-located `Client` emits `OfferService` on the server's
 /// behalf.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
+pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R, O>(
     config: ServerConfig,
     unicast_socket: H,
     sd_socket: H,
@@ -754,6 +901,7 @@ pub(super) async fn run_combined<H, T, Sub, Hsd, Tm, R>(
     recv_send_buf: &mut [u8],
     announce_send_buf: &mut [u8],
     non_sd_observer: Option<(super::NonSdRequestCallback, usize)>,
+    request_observer: Option<&O>,
 ) -> Result<(), Error>
 where
     H: SharedHandle<T>,
@@ -762,6 +910,7 @@ where
     Hsd: SharedHandle<SdStateManager>,
     Tm: Timer,
     R: E2ERegistryHandle,
+    O: RequestObserver + ?Sized,
 {
     if is_passive {
         crate::log::warn!(
@@ -789,6 +938,7 @@ where
         sd_buf,
         recv_send_buf,
         non_sd_observer,
+        request_observer,
     );
 
     if config.announce {
@@ -1053,6 +1203,12 @@ mod tests {
         let mut wire = [0u8; 512];
         let sd_len = sd_payload.encode_to_slice(&mut wire).expect("encode");
         (wire, sd_len)
+    }
+
+    #[test]
+    fn fewer_bytes_than_a_header_behind_the_messages_are_padding() {
+        assert!(is_padding(&[0; 15]));
+        assert!(!is_padding(&[0; 16]));
     }
 
     /// `send_subscribe_ack_from_view` with a 24-byte buf must return

@@ -79,6 +79,7 @@ define_static_channels! {
         (Result<(), ClientError>, 8),
         (Result<RawPayload, ClientError>, 4),
         (Result<RebootFlag, ClientError>, 4),
+        (Result<simple_someip::protocol::sd::SdEndpoint, ClientError>, 4),
     ],
     bounded: [
         ((ControlMessage<RawPayload, BareMetalChannels>, 4), 1),

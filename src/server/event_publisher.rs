@@ -1,11 +1,12 @@
 //! Event publishing functionality
 
 use super::Error;
+use super::request::{Reply, ResponseTarget};
 use super::service_info::Subscriber;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
 use crate::e2e::E2EKey;
-use crate::protocol::{Header, Message};
+use crate::protocol::{Header, Message, MessageId, MessageTypeField};
 use crate::traits::PayloadWireFormat;
 use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
 use automotive_wire_codec::Encode;
@@ -841,6 +842,79 @@ where
             &mut buf,
         )
         .await
+    }
+
+    /// Answers the request `target` names with `reply` and `payload`, using caller-provided
+    /// scratch.
+    ///
+    /// The answer copies the request's message id, request id, protocol version and interface
+    /// version, and sets the length, message type and return code (`feat_req_someip_338`). It
+    /// goes back to where the request came from, from the socket the request arrived on
+    /// (`feat_req_someip_49`). No E2E protection is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidUsage`]`("respond_to_fire_and_forget")` if `target` is a
+    /// fire-and-forget request, which gets no answer (`feat_req_someip_345`),
+    /// [`Error::Capacity`]`("udp_buffer")` if `buf` is too small for the 16-byte SOME/IP header
+    /// plus `payload`, [`Error::Transport`] if the send fails, or a serialization error if the
+    /// header fails to encode.
+    pub async fn respond_with_buffers(
+        &self,
+        target: ResponseTarget,
+        reply: Reply,
+        payload: &[u8],
+        buf: &mut [u8],
+    ) -> Result<(), Error> {
+        if !target.expects_response() {
+            return Err(Error::InvalidUsage("respond_to_fire_and_forget"));
+        }
+        if buf.len() < 16 || payload.len() > buf.len() - 16 {
+            crate::log::error!(
+                "response payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping response",
+                payload.len(),
+                buf.len()
+            );
+            return Err(Error::Capacity(CapacityKind::UdpBuffer));
+        }
+        let header = Header::new(
+            MessageId::new_from_service_and_method(target.service_id(), target.method_id()),
+            target.request_id(),
+            target.protocol_version(),
+            target.interface_version(),
+            MessageTypeField::new(reply.message_type(), false),
+            reply.return_code(),
+            payload.len(),
+        );
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
+        let total_len = header_len + payload.len();
+        buf[header_len..total_len].copy_from_slice(payload);
+        self.socket
+            .get()
+            .send_to(&buf[..total_len], target.source())
+            .await
+            .map_err(Error::Transport)
+    }
+
+    /// Answers the request `target` names with `reply` and `payload`; see
+    /// [`Self::respond_with_buffers`], which this wraps with a scratch buffer of
+    /// [`crate::UDP_BUFFER_SIZE`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::respond_with_buffers`].
+    #[cfg(feature = "_alloc")]
+    pub async fn respond(
+        &self,
+        target: ResponseTarget,
+        reply: Reply,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let mut buf = alloc::vec![0u8; crate::UDP_BUFFER_SIZE];
+        self.respond_with_buffers(target, reply, payload, &mut buf)
+            .await
     }
 
     /// Return the endpoint addresses currently subscribed to an event group.
@@ -1715,5 +1789,47 @@ mod tests {
         .expect("spawned publish task must not panic");
 
         assert_eq!(sent, 1);
+    }
+    /// A fire-and-forget request gets no answer, not even an error (`feat_req_someip_345`,
+    /// `feat_req_someip_654`), so answering one is refused and nothing is sent.
+    #[tokio::test]
+    async fn a_fire_and_forget_request_is_not_answered() {
+        use crate::protocol::{HeaderView, MessageType, MessageTypeField, ReturnCode};
+        use crate::server::{Reply, ResponseTarget};
+
+        let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));
+        let (publisher, _) = make_publisher(subscriptions).await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(source) = client.local_addr().unwrap() else {
+            unreachable!("bound on IPv4")
+        };
+        let mut bytes = [0u8; 16];
+        Header::new(
+            MessageId::new_from_service_and_method(0x1234, 0x0007),
+            0x00AB_0005,
+            1,
+            3,
+            MessageTypeField::new(MessageType::RequestNoReturn, false),
+            ReturnCode::Ok,
+            0,
+        )
+        .encode_to_slice(&mut bytes)
+        .unwrap();
+        let (header, _) = HeaderView::parse(&bytes).unwrap();
+        let target = ResponseTarget::new(source, &header);
+
+        let answered = publisher.respond(target, Reply::OK, b"pong").await;
+
+        assert!(matches!(answered, Err(Error::InvalidUsage(_))));
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "nothing is sent"
+        );
     }
 }

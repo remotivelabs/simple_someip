@@ -135,6 +135,15 @@ This implementation follows the **event-based** model where:
 
 This is common in automotive SOME/IP deployments where control commands are broadcast as events, allowing multiple ECUs to subscribe without request/response overhead.
 
+Requests to an offered service are handled beside that: the receive loop tells the
+`RequestObserver` in `ServerDeps::request_observer` about every `REQUEST` and
+`REQUEST_NO_RETURN` on the service port, with the request's `ResponseTarget`
+(source, message id, request id and versions). The application answers later,
+from any task, through `EventPublisher::respond` with a `Reply` — a response
+carrying a return code, or an exception for errors when those are configured.
+A fire-and-forget request gets no answer. Under `server-tokio`, `RequestSender`
+is an observer that queues requests on a channel.
+
 ## API Reference
 
 ### `ServerConfig`
