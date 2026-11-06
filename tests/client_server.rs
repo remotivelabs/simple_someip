@@ -1536,6 +1536,29 @@ async fn test_a_server_and_a_client_share_the_sd_sockets_of_one_interface() {
 /// shared sockets on one local port each observe the requests of their own service and answer
 /// from the port. A second instance of one service there is refused, as instances of a service
 /// listen on different ports (feat_req_someip_648).
+/// A client built on the shared sockets' transport exchanges SD on their endpoint, not the
+/// default one, so its discovery bind is a tap of the shared sockets.
+#[tokio::test]
+async fn test_a_client_on_shared_sockets_exchanges_sd_on_their_endpoint() {
+    let interface = Ipv4Addr::new(127, 0, 0, 6);
+    let endpoint = sd::SdEndpoint::new(Ipv4Addr::new(239, 255, 0, 252), 30_491).unwrap();
+    let shared = simple_someip::SharedSd::bind(interface, endpoint, true)
+        .await
+        .expect("the shared SD sockets");
+    let (client, _updates, run) = TestClient::new_with_deps(
+        simple_someip::ClientDeps::tokio(interface).with_factory(shared.transport()),
+        true,
+    );
+    tokio::spawn(run);
+
+    assert_eq!(client.sd_endpoint().await.unwrap(), endpoint);
+    client
+        .bind_discovery()
+        .await
+        .expect("discovery binds on the shared sockets");
+    client.shut_down();
+}
+
 #[tokio::test]
 async fn test_two_services_share_one_endpoint_socket() {
     let interface = Ipv4Addr::new(127, 0, 0, 4);

@@ -3009,8 +3009,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Small delay, then send valid subscribe
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // A server with no request observer still answers a request to a service it does not
+        // offer: an ERROR message with E_UNKNOWN_SERVICE, echoing the request's ids.
+        let mut error_buf = [0u8; 64];
+        let (error_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_socket.recv_from(&mut error_buf),
+        )
+        .await
+        .expect("Timeout waiting for E_UNKNOWN_SERVICE")
+        .unwrap();
+        assert_eq!(error_len, 16);
+        assert_eq!(&error_buf[..4], &[0x12, 0x34, 0x00, 0x01]);
+        assert_eq!(&error_buf[8..12], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(error_buf[14], 0x81, "message type ERROR");
+        assert_eq!(error_buf[15], ReturnCode::UnknownService.as_u8());
+
+        // Then send valid subscribe
         let message = make_subscription_header(
             0x5B,
             1,
