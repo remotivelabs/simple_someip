@@ -56,6 +56,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 
     /// Bind a unicast socket on `port` (0 = ephemeral) and submit its
@@ -75,6 +76,7 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
 }
 
@@ -119,6 +121,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -133,6 +136,7 @@ where
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
+                sd_endpoint,
                 buf,
             )
             .await
@@ -166,6 +170,7 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -177,6 +182,7 @@ where
                 &self.spawner,
                 interface,
                 e2e_registry,
+                sd_port,
                 buf,
             )
             .await
@@ -222,6 +228,7 @@ where
         session_id: u16,
         session_has_wrapped: bool,
         multicast_loopback: bool,
+        sd_endpoint: crate::protocol::sd::SdEndpoint,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -236,6 +243,7 @@ where
                 session_id,
                 session_has_wrapped,
                 multicast_loopback,
+                sd_endpoint,
                 buf,
             )
             .await
@@ -269,6 +277,7 @@ where
         &self,
         interface: Ipv4Addr,
         e2e_registry: R,
+        sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_ {
         async move {
             let buf = self
@@ -280,6 +289,7 @@ where
                 &self.spawner,
                 interface,
                 e2e_registry,
+                sd_port,
                 buf,
             )
             .await

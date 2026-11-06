@@ -18,6 +18,7 @@ The library supports both `std` and `no_std` environments, making it suitable fo
 - **End-to-End protection** — Profile 4 (CRC-32) and Profile 5 (CRC-16) with zero-allocation APIs
 - **Executor-agnostic transport traits** — `TransportSocket`, `TransportFactory`, `Timer`, `Spawner` (default `tokio` impls behind feature gates)
 - **Async client and server** — tokio-based, gated behind optional feature flags
+- **Request/response on both sides** — the client awaits a method's response; the server hands requests to an observer and answers them later, with a response or an exception
 - **`embedded-io`** traits for serialization — abstracts over `std::io::Read`/`Write`
 
 ## Modules

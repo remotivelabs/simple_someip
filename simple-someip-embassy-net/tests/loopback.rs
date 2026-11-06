@@ -426,6 +426,7 @@ define_static_channels! {
         (Result<(), ClientError>, 16),
         (Result<RawPayload, ClientError>, 8),
         (Result<RebootFlag, ClientError>, 8),
+        (Result<simple_someip::protocol::sd::SdEndpoint, ClientError>, 8),
     ],
     bounded: [
         ((ControlMessage<RawPayload, LoopbackTestChannels>, 4), 4),
@@ -607,6 +608,7 @@ async fn client_receives_server_sd_announcement() {
                 e2e_registry: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
+                request_observer: None,
             };
 
             // Default `H = Arc<F::Socket>`. `Arc<T>:
@@ -735,6 +737,7 @@ async fn client_send_request_server_runloop_stable() {
                 e2e_registry: server_e2e,
                 subscriptions: server_subs,
                 non_sd_observer: None,
+                request_observer: None,
             };
 
             // Explicit `Arc<EmbassyNetSocket>` `H` so the compiler

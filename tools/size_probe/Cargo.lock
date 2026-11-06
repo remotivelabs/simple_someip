@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "automotive-wire-codec"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3619f2db27c70d93c5390ce2e90482c26c99675a85392271d2bfe07451234f6"
+dependencies = [
+ "embedded-io 0.7.1",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,8 +175,9 @@ dependencies = [
 
 [[package]]
 name = "simple-someip"
-version = "0.8.0"
+version = "0.14.0"
 dependencies = [
+ "automotive-wire-codec",
  "crc",
  "embassy-sync",
  "embedded-io 0.7.1",

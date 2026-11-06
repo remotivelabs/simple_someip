@@ -434,6 +434,7 @@ fn build_server() -> bool {
             publisher: (*core::ptr::addr_of!(PUBLISHER)).assume_init_ref(),
             started: &SERVER_STARTED,
             non_sd_observer: Some((dispatch as crate::server::NonSdRequestCallback, 0)),
+            request_observer: None,
         }
     };
     match Server::new_with_handles(storage, config) {
