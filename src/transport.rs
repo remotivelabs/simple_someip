@@ -621,6 +621,12 @@ pub trait TransportFactory {
     /// and port pair is already bound (and `reuse_*` was not enabled).
     /// Other backend-level failures surface as [`TransportError::Io`].
     fn bind<'a>(&'a self, addr: SocketAddrV4, options: &'a SocketOptions) -> Self::BindFuture<'a>;
+
+    /// Where SD is exchanged, when the factory decides it: one whose SD sockets are bound
+    /// already, as shared ones are, names their endpoint, and a client built on it starts there.
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint> {
+        None
+    }
 }
 
 /// Executor-agnostic sleep primitive.

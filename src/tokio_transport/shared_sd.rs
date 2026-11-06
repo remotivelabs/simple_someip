@@ -102,7 +102,7 @@ struct Inner {
     interface: Ipv4Addr,
     endpoint: SdEndpoint,
     taps: Mutex<Vec<(Origin, mpsc::Sender<Arc<Datagram>>)>>,
-    /// What the servers served on these sockets offer, each while its server lives.
+    /// The servers served on these sockets, each while it lives.
     offered: Mutex<Vec<Offered>>,
     /// The endpoint sockets by port, while a participant holds them.
     endpoints: tokio::sync::Mutex<HashMap<u16, Weak<Endpoint>>>,
@@ -113,35 +113,22 @@ struct Inner {
     workers: Workers,
 }
 
-/// A service instance a server served on the shared sockets offers, while the server holds its
-/// SD socket.
+/// A server served on the shared sockets, while it holds its SD socket.
 struct Offered {
-    service: u16,
-    instance: u16,
+    config: ServerConfig,
     by: Weak<SharedSocket>,
 }
 
 impl Inner {
-    /// Notes what the server `config` describes offers, its own instance and its accepted
-    /// offers, for as long as it holds `sd_socket`.
+    /// Notes the server `config` describes, for as long as it holds `sd_socket`.
     fn offer(&self, config: &ServerConfig, sd_socket: &Arc<SharedSocket>) {
-        let by = Arc::downgrade(sd_socket);
-        let mut offered = self
-            .offered
+        self.offered
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        offered.push(Offered {
-            service: config.service_id,
-            instance: config.instance_id,
-            by: by.clone(),
-        });
-        for offer in &config.accepted_offers {
-            offered.push(Offered {
-                service: offer.service_id,
-                instance: offer.instance_id,
-                by: by.clone(),
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Offered {
+                config: config.clone(),
+                by: Arc::downgrade(sd_socket),
             });
-        }
     }
 
     /// Refuses, for the servers, every subscription in `datagram` to a service instance none of
@@ -163,10 +150,10 @@ impl Inner {
             return;
         }
         message.extend_from_slice(&payload);
+        let _sending = self.sending.lock().await;
         let Some(stamped) = self.stamped(&message) else {
             return;
         };
-        let _sending = self.sending.lock().await;
         if let Err(e) = self.unicast.send_to(&stamped, subscriber).await {
             crate::log::warn!("SubscribeNack to {} not sent: {:?}", subscriber, e);
         }
@@ -191,8 +178,10 @@ impl Inner {
             .filter(|entry| entry.entry_type().ok() == Some(EntryType::Subscribe))
             .filter(|entry| entry.ttl() != 0)
             .filter(|entry| {
-                !offered.iter().any(|offer| {
-                    offer.service == entry.service_id() && offer.instance == entry.instance_id()
+                !offered.iter().any(|server| {
+                    server
+                        .config
+                        .offers(entry.service_id(), entry.instance_id())
                 })
             })
             .map(|entry| {
@@ -417,7 +406,8 @@ impl SharedSd {
     }
 
     /// A client's transport factory: a tap for each discovery bind on the SD port, its own
-    /// socket for everything else.
+    /// socket for everything else. A client built on it exchanges SD on the shared sockets'
+    /// endpoint.
     #[must_use]
     pub fn transport(&self) -> SharedTransport {
         SharedTransport {
@@ -645,7 +635,7 @@ async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         taps.retain(|(_, tap)| !tap.is_closed());
-        for (addressed, bytes) in messages(&buf[..received.bytes_received]) {
+        for (addressed, bytes) in messages(&buf[..received.bytes_received], received.source) {
             let datagram = Arc::new(Datagram {
                 bytes: bytes.to_vec(),
                 source: received.source,
@@ -666,11 +656,10 @@ async fn fan_out_endpoint(endpoint: Weak<Endpoint>) {
 /// The taps a message goes to. A request goes to the server of its service, else to any server,
 /// so that one answers it with `E_UNKNOWN_SERVICE`. A response, error or event goes to the clients,
 /// so that a client consuming a service that a server on the port offers too gets its answers.
-/// What is no message goes to the clients. A message no tap of its kind takes goes to the
-/// first tap.
+/// A message no tap of its kind takes goes to the first tap.
 fn takers(
     taps: &[(Serves, mpsc::Sender<Arc<Datagram>>)],
-    addressed: Option<Addressed>,
+    addressed: Addressed,
 ) -> Vec<&mpsc::Sender<Arc<Datagram>>> {
     let of = |wanted: &dyn Fn(Serves) -> bool| -> Vec<_> {
         taps.iter()
@@ -679,10 +668,10 @@ fn takers(
             .collect()
     };
     let chosen = match addressed {
-        Some(Addressed {
+        Addressed {
             service,
             request: true,
-        }) => {
+        } => {
             let served = of(&|serves| serves == Serves::Service(service));
             if served.is_empty() {
                 of(&|serves| serves != Serves::Rest)
@@ -708,39 +697,26 @@ fn is_request(message_type: u8) -> bool {
     matches!(message_type & !0x20, 0x00 | 0x01)
 }
 
-/// The SOME/IP messages of a datagram, each with where it goes: a header's length counts the
-/// bytes behind its first eight. Fewer bytes than a header behind the last message are padding
-/// and go nowhere. What else does not parse as a message is one message going nowhere in
-/// particular.
-fn messages(datagram: &[u8]) -> Vec<(Option<Addressed>, &[u8])> {
-    const HEADER: usize = 16;
-    let mut messages = Vec::new();
-    let mut rest = datagram;
-    while !rest.is_empty() {
-        let size = rest
-            .get(4..8)
-            .and_then(|len| {
-                usize::try_from(u32::from_be_bytes([len[0], len[1], len[2], len[3]])).ok()
-            })
-            .and_then(|len| len.checked_add(8));
-        match size {
-            Some(size) if size >= HEADER && size <= rest.len() => {
-                let (message, behind) = rest.split_at(size);
-                let addressed = Addressed {
-                    service: u16::from_be_bytes([message[0], message[1]]),
-                    request: is_request(message[14]),
-                };
-                messages.push((Some(addressed), message));
-                rest = behind;
-            }
-            _ if !messages.is_empty() && rest.len() < HEADER => break,
-            _ => {
-                messages.push((None, rest));
-                break;
-            }
-        }
+/// The SOME/IP messages of a datagram, each with where it goes, split as the server's receive
+/// loop splits them. A message that does not decode goes nowhere, and nor does what is behind
+/// it, as in the server.
+fn messages(datagram: &[u8], source: SocketAddrV4) -> Vec<(Addressed, &[u8])> {
+    let mut found = Vec::new();
+    for (message, bytes) in crate::protocol::messages(datagram) {
+        let Ok(view) = message else {
+            crate::log::warn!("A message from {} that does not decode dropped", source);
+            break;
+        };
+        let header = view.header();
+        found.push((
+            Addressed {
+                service: header.message_id().service_id(),
+                request: is_request(bytes[14]),
+            },
+            bytes,
+        ));
     }
-    messages
+    found
 }
 
 /// The next datagram a tap received, into `buf`.
@@ -931,6 +907,10 @@ impl TransportFactory for SharedTransport {
                 .await
                 .map(SharedSocket::Own)
         })
+    }
+
+    fn sd_endpoint(&self) -> Option<SdEndpoint> {
+        Some(self.shared.inner.endpoint)
     }
 }
 
@@ -1407,24 +1387,23 @@ mod tests {
         assert!(errors.give_up(TransportError::Io(IoErrorKind::Other)));
     }
 
+    const FROM: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+
     #[test]
-    fn what_is_no_message_is_one_message_going_nowhere_in_particular() {
-        assert_eq!(messages(b"short"), std::vec![(None, b"short".as_slice())]);
-        let junk = b"junk, and enough of it to be a header";
+    fn a_message_that_does_not_decode_goes_nowhere_and_nor_does_what_is_behind_it() {
+        assert!(messages(b"short", FROM).is_empty());
         let mut datagram = message(3, b"x");
-        datagram.extend_from_slice(junk);
+        datagram.extend_from_slice(b"junk, and enough of it to be a header");
+        datagram.extend_from_slice(&message(4, b"y"));
         assert_eq!(
-            messages(&datagram),
-            std::vec![
-                (
-                    Some(Addressed {
-                        service: 3,
-                        request: true
-                    }),
-                    message(3, b"x").as_slice()
-                ),
-                (None, junk.as_slice())
-            ]
+            messages(&datagram, FROM),
+            std::vec![(
+                Addressed {
+                    service: 3,
+                    request: true
+                },
+                message(3, b"x").as_slice()
+            )]
         );
     }
 
@@ -1433,7 +1412,7 @@ mod tests {
         let mut datagram = message(3, b"x");
         datagram.extend_from_slice(&[0, 0, 0]);
 
-        let found = messages(&datagram);
+        let found = messages(&datagram, FROM);
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].1, message(3, b"x").as_slice());

@@ -211,6 +211,48 @@ impl<PayloadDefinition: PayloadWireFormat> Encode for Message<PayloadDefinition>
     }
 }
 
+/// The messages of a datagram, one behind the other, each with its bytes. A message that does
+/// not decode is the last: where it ends is unknown. Fewer bytes than a header behind a message
+/// are padding, and no message.
+#[cfg(feature = "server")]
+pub(crate) fn messages(datagram: &[u8]) -> Messages<'_> {
+    Messages {
+        rest: datagram,
+        first: true,
+    }
+}
+
+/// The iterator [`messages`] returns.
+#[cfg(feature = "server")]
+pub(crate) struct Messages<'a> {
+    rest: &'a [u8],
+    first: bool,
+}
+
+#[cfg(feature = "server")]
+impl<'a> Iterator for Messages<'a> {
+    type Item = (Result<MessageView<'a>, Error>, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const HEADER_LEN: usize = 16;
+        if self.rest.is_empty() || (!self.first && self.rest.len() < HEADER_LEN) {
+            return None;
+        }
+        self.first = false;
+        let at = self.rest;
+        match MessageView::decode(at) {
+            Ok((view, behind)) => {
+                self.rest = behind;
+                Some((Ok(view), &at[..at.len() - behind.len()]))
+            }
+            Err(error) => {
+                self.rest = &[];
+                Some((Err(error), at))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

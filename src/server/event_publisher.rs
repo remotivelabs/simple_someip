@@ -6,7 +6,7 @@ use super::service_info::Subscriber;
 use super::subscription_manager::{SUBSCRIBERS_PER_GROUP, SubscriptionHandle};
 use crate::CapacityKind;
 use crate::e2e::E2EKey;
-use crate::protocol::{Header, Message, MessageId, MessageTypeField};
+use crate::protocol::{Header, Message};
 use crate::traits::PayloadWireFormat;
 use crate::transport::{E2ERegistryHandle, SharedHandle, TransportSocket};
 use automotive_wire_codec::Encode;
@@ -869,28 +869,7 @@ where
         if !target.expects_response() {
             return Err(Error::InvalidUsage("respond_to_fire_and_forget"));
         }
-        if buf.len() < 16 || payload.len() > buf.len() - 16 {
-            crate::log::error!(
-                "response payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping response",
-                payload.len(),
-                buf.len()
-            );
-            return Err(Error::Capacity(CapacityKind::UdpBuffer));
-        }
-        let header = Header::new(
-            MessageId::new_from_service_and_method(target.service_id(), target.method_id()),
-            target.request_id(),
-            target.protocol_version(),
-            target.interface_version(),
-            MessageTypeField::new(reply.message_type(), false),
-            reply.return_code(),
-            payload.len(),
-        );
-        let header_len = header
-            .encode_to_slice(buf)
-            .map_err(crate::protocol::Error::from)?;
-        let total_len = header_len + payload.len();
-        buf[header_len..total_len].copy_from_slice(payload);
+        let total_len = target.encode_answer(reply, payload, buf)?;
         self.socket
             .get()
             .send_to(&buf[..total_len], target.source())
@@ -1794,7 +1773,7 @@ mod tests {
     /// `feat_req_someip_654`), so answering one is refused and nothing is sent.
     #[tokio::test]
     async fn a_fire_and_forget_request_is_not_answered() {
-        use crate::protocol::{HeaderView, MessageType, MessageTypeField, ReturnCode};
+        use crate::protocol::{HeaderView, MessageId, MessageType, MessageTypeField, ReturnCode};
         use crate::server::{Reply, ResponseTarget};
 
         let subscriptions = Arc::new(RwLock::new(SubscriptionManager::new()));

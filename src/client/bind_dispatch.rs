@@ -78,6 +78,9 @@ where
         e2e_registry: R,
         sd_port: u16,
     ) -> impl Future<Output = Result<SocketManager<MD, C>, Error>> + '_;
+
+    /// The factory's SD endpoint, where the client starts exchanging SD.
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint>;
 }
 
 /// `BindDispatch` for the multi-threaded path: requires a
@@ -110,6 +113,10 @@ where
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint> {
+        self.factory.sd_endpoint()
+    }
+
     // `async move` body (rather than `async fn`) is required: the trait
     // method returns `impl Future`, and the block must capture `&self` to
     // claim a buffer (#125) before delegating to `SocketManager::bind_*`.
@@ -217,6 +224,10 @@ where
     super::socket_manager::SendMessage<MD, C>: crate::transport::BoundedPooled<C, 16>,
     Result<(), Error>: crate::transport::OneshotPooled<C>,
 {
+    fn sd_endpoint(&self) -> Option<crate::protocol::sd::SdEndpoint> {
+        self.factory.sd_endpoint()
+    }
+
     // `async move` body (rather than `async fn`) is required: the trait
     // method returns `impl Future`, and the block must capture `&self` to
     // claim a buffer (#125) before delegating to `SocketManager::bind_*`.

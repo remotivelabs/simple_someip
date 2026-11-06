@@ -48,7 +48,7 @@ pub use error::Error;
 /// `crate::transport::BoundedPooled<C, 4>`. End users typically do not
 /// reference this type directly — the `define_static_channels!` macro
 /// (under `feature = "bare_metal"`) names it for them.
-pub use inner::ControlMessage;
+pub use inner::{ControlMessage, SdTarget};
 pub use service_registry::ServiceEndpointKey;
 /// Per-socket message types exposed for the same reason as
 /// [`ControlMessage`] — see its docstring.
@@ -1429,34 +1429,6 @@ where
             let mut count = 0u64;
             loop {
                 timer.sleep(interval).await;
-                // Asked each tick: the endpoint may be set after the loop started.
-                let (endpoint_rx, endpoint_msg) =
-                    ControlMessage::<MessageDefinitions, TokioChannels>::query_sd_endpoint();
-                let Some(sender) = weak_sender.upgrade() else {
-                    crate::log::info!("Client shut down, stopping SD announcements");
-                    break;
-                };
-                let enqueue_ok = sender.send(endpoint_msg).await.is_ok();
-                drop(sender);
-                if !enqueue_ok {
-                    crate::log::warn!("SD announcement channel closed, stopping");
-                    break;
-                }
-                let target = match endpoint_rx.recv().await {
-                    Ok(Ok(endpoint)) => endpoint.multicast(),
-                    Ok(Err(e)) => {
-                        crate::log::warn!(
-                            "SD announcement endpoint query returned error ({:?}), skipping tick",
-                            e
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        crate::log::warn!("SD announcement endpoint query dropped, stopping");
-                        break;
-                    }
-                };
-
                 let (flag_rx, flag_msg) =
                     ControlMessage::<MessageDefinitions, TokioChannels>::query_reboot_flag();
                 let Some(sender) = weak_sender.upgrade() else {
@@ -1486,8 +1458,10 @@ where
                 let mut header = sd_header.clone();
                 MessageDefinitions::set_reboot_flag(&mut header, reboot);
 
+                // To the endpoint the client has when it sends: it may be set after the loop
+                // started.
                 let (response, message) =
-                    ControlMessage::<MessageDefinitions, TokioChannels>::send_sd(target, header);
+                    ControlMessage::<MessageDefinitions, TokioChannels>::send_sd_multicast(header);
 
                 let Some(sender) = weak_sender.upgrade() else {
                     crate::log::info!("Client shut down, stopping SD announcements");

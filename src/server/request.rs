@@ -100,6 +100,47 @@ impl ResponseTarget {
     pub const fn expects_response(self) -> bool {
         self.expects_response
     }
+
+    /// The answer `reply` with `payload` into `buf`: the request's message id, request id and
+    /// versions, the length, message type and return code (`feat_req_someip_338`); its length.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Capacity`](super::Error::Capacity)`("udp_buffer")` if `buf` is too small for the
+    /// 16-byte header plus `payload`, or a serialization error if the header fails to encode.
+    pub(crate) fn encode_answer(
+        self,
+        reply: Reply,
+        payload: &[u8],
+        buf: &mut [u8],
+    ) -> Result<usize, super::Error> {
+        use crate::protocol::{Header, MessageId, MessageTypeField};
+        use automotive_wire_codec::Encode;
+
+        if buf.len() < 16 || payload.len() > buf.len() - 16 {
+            crate::log::error!(
+                "response payload ({} bytes) + 16-byte header exceeds buf.len() ({}); dropping response",
+                payload.len(),
+                buf.len()
+            );
+            return Err(super::Error::Capacity(crate::CapacityKind::UdpBuffer));
+        }
+        let header = Header::new(
+            MessageId::new_from_service_and_method(self.service_id, self.method_id),
+            self.request_id,
+            self.protocol_version,
+            self.interface_version,
+            MessageTypeField::new(reply.message_type(), false),
+            reply.return_code(),
+            payload.len(),
+        );
+        let header_len = header
+            .encode_to_slice(buf)
+            .map_err(crate::protocol::Error::from)?;
+        let total_len = header_len + payload.len();
+        buf[header_len..total_len].copy_from_slice(payload);
+        Ok(total_len)
+    }
 }
 
 /// A request to an offered service, as received. Borrows the receive buffer.

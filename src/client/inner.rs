@@ -42,6 +42,15 @@ const PENDING_RESPONSES_CAP: usize = 64;
 /// two.
 const UNICAST_SOCKETS_CAP: usize = 8;
 
+/// Where an SD message goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdTarget {
+    /// One address.
+    To(SocketAddrV4),
+    /// The multicast group and port of the client's SD endpoint when the message is sent.
+    Multicast,
+}
+
 pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
     SetInterface(Ipv4Addr, C::OneshotSender<Result<(), Error>>),
     /// Exchange SD on another group and port; a bound discovery socket is rebound there.
@@ -53,11 +62,7 @@ pub enum ControlMessage<P: PayloadWireFormat + 'static, C: ChannelFactory> {
     QuerySdEndpoint(C::OneshotSender<Result<crate::protocol::sd::SdEndpoint, Error>>),
     BindDiscovery(C::OneshotSender<Result<(), Error>>),
     UnbindDiscovery(C::OneshotSender<Result<(), Error>>),
-    SendSD(
-        SocketAddrV4,
-        P::SdHeader,
-        C::OneshotSender<Result<(), Error>>,
-    ),
+    SendSD(SdTarget, P::SdHeader, C::OneshotSender<Result<(), Error>>),
     AddEndpoint(
         ServiceEndpointKey,
         u16, // instance_id
@@ -194,7 +199,18 @@ where
         header: P::SdHeader,
     ) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
         let (sender, receiver) = C::oneshot();
-        (receiver, Self::SendSD(socket_addr, header, sender))
+        (
+            receiver,
+            Self::SendSD(SdTarget::To(socket_addr), header, sender),
+        )
+    }
+
+    /// Send `header` to the multicast group and port of the SD endpoint the client has when
+    /// the message is sent.
+    #[must_use]
+    pub fn send_sd_multicast(header: P::SdHeader) -> (C::OneshotReceiver<Result<(), Error>>, Self) {
+        let (sender, receiver) = C::oneshot();
+        (receiver, Self::SendSD(SdTarget::Multicast, header, sender))
     }
     #[must_use]
     pub fn add_endpoint(
@@ -490,7 +506,9 @@ where
             sd_session_has_wrapped: false,
             e2e_registry,
             multicast_loopback,
-            sd_endpoint: crate::protocol::sd::SdEndpoint::DEFAULT,
+            sd_endpoint: dispatch
+                .sd_endpoint()
+                .unwrap_or(crate::protocol::sd::SdEndpoint::DEFAULT),
             dispatch,
             timer,
             phantom: core::marker::PhantomData,
@@ -1003,6 +1021,10 @@ where
                                 &header,
                             ) {
                                 Ok(message) => {
+                                    let target = match target {
+                                        SdTarget::To(address) => address,
+                                        SdTarget::Multicast => self.sd_endpoint.multicast(),
+                                    };
                                     debug!("Sending {:?} to {}", &message, target);
                                     let send_result = self
                                         .discovery_socket
